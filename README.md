@@ -1,1 +1,1 @@
-# DualBrainSystem
+# DualMindSystem
