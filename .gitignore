@@ -5,7 +5,7 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
-
+.vscode
 .DS_Store
 
 # MuJoCo runtime logs and local experiment outputs
