@@ -1,0 +1,37 @@
+schema: ExecutorConfigV1
+scene_path: scenes/pick_and_place.xml
+object_body: block_1
+target_body: null
+
+physics_dt_s: 0.002
+cartesian_step_m: 0.01
+action_timeout_s: 0.5
+action_mode: atomic
+translation_frame: robot_base
+rotation_joint: joint6
+rotation_step_deg: 5.0
+
+frames:
+  robot_base_body: panthera
+  tcp_site: tcp
+
+robot:
+  gripper_open_joint_m: 0.04
+  gripper_closed_joint_m: 0.0
+  gripper_position_kp: 200
+  gripper_effort_limit_n: 100
+
+acceptance:
+  translation_error_m: 0.002
+  rotation_error_deg: 1.0
+  rotation_tcp_drift_m: 0.002
+  gripper_error_m: 0.001
+
+executor:
+  keyframe_name: v1_home
+  dls_damping: 0.03
+  orientation_weight_m_per_rad: 0.2
+  maximum_joint_update_rad: 0.08
+  hold_duration_s: 0.1
+  free_space_convergence_fraction: 0.85
+  held_object_convergence_fraction: 1.0

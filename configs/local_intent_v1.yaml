@@ -1,0 +1,7 @@
+schema: LocalIntentConfigV1
+# Trial values for intent validity/progress, not task success thresholds.
+# Recalibrate against observed noise and latency before hardware use.
+minimum_progress_m: 0.0005
+maximum_actions_without_new_best: 6
+maximum_local_replans: 3
+maximum_reference_shift_m: 0.015

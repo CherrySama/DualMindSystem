@@ -1,0 +1,68 @@
+schema: RuntimeVerifierConfigV1
+
+# These values belong to the runtime deployment profile. They are not generated
+# by the slow brain and can be re-calibrated independently for real hardware.
+visual:
+  maximum_age_s: 0.30
+
+visual_relations:
+  # Robot-base convention: +x is in front, +y is left.
+  directional_gap_m: 0.020
+  near_maximum_clearance_m: 0.080
+  separated_minimum_clearance_m: 0.120
+  support_height_tolerance_m: 0.012
+  support_minimum_overlap_fraction: 0.50
+  volume_height_tolerance_m: 0.010
+
+gripper:
+  open_position_m: 0.04
+  position_tolerance_m: 0.002
+
+grasp:
+  xy_tolerance_m: 0.008
+  z_tolerance_m: 0.010
+
+action_review:
+  # Trial margin for this simulation; calibrate against visual noise before hardware use.
+  minimum_pick_xy_progress_m: 0.0005
+  maximum_consecutive_rejections: 2
+  maximum_consecutive_nonprogress_actions: 3
+
+verification:
+  maximum_pending_seconds: 5.0
+
+transport:
+  minimum_bottom_clearance_m: 0.040
+
+release:
+  maximum_bottom_clearance_m: 0.035
+
+placement:
+  obstacle_clearance_m: 0.015
+  reference_maximum_displacement_m: 0.015
+  required_consecutive_observations: 3
+  minimum_observation_interval_s: 0.30
+  maximum_centroid_shift_m: 0.003
+
+arrangement:
+  row_cross_axis_tolerance_m: 0.030
+  minimum_pairwise_clearance_m: 0.015
+
+press:
+  point_xy_tolerance_m: 0.010
+  minimum_travel_m: 0.008
+  visual_confirmation_margin_m: 0.002
+
+surface_push:
+  closed_gripper_position_m: 0.0
+  gripper_position_tolerance_m: 0.002
+  precontact_clearance_m: 0.030
+  precontact_xy_tolerance_m: 0.010
+  approach_lateral_tolerance_m: 0.015
+  tcp_height_above_surface_m: 0.020
+  tcp_height_tolerance_m: 0.012
+  reposition_height_above_surface_m: 0.065
+  clear_of_region_margin_m: 0.015
+  required_consecutive_observations: 3
+  minimum_observation_interval_s: 0.30
+  maximum_centroid_shift_m: 0.003

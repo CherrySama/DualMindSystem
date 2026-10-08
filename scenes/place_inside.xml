@@ -1,0 +1,73 @@
+<mujoco model="place_inside">
+  <include file="common.xml" />
+  <default>
+    <default class="task_tool">
+      <geom rgba="0 0 0 0" contype="0" conaffinity="0" mass="0" group="4" />
+    </default>
+  </default>
+  <asset>
+    <material name="block_red" rgba="0.82 0.10 0.08 1" />
+    <material name="bowl_material" rgba="0.82 0.24 0.18 1" />
+    <mesh name="bowl_visual" file="assets/mujoco/002_bowl/model3/visual/bowl_visual.obj" scale="0.067164251827 0.067164251827 0.067164251827" />
+    <mesh name="bowl_collision_00" file="assets/mujoco/002_bowl/model3/collision/bowl_collision_00.obj" scale="0.067164251827 0.067164251827 0.067164251827" />
+    <mesh name="bowl_collision_01" file="assets/mujoco/002_bowl/model3/collision/bowl_collision_01.obj" scale="0.067164251827 0.067164251827 0.067164251827" />
+    <mesh name="bowl_collision_02" file="assets/mujoco/002_bowl/model3/collision/bowl_collision_02.obj" scale="0.067164251827 0.067164251827 0.067164251827" />
+    <mesh name="bowl_collision_03" file="assets/mujoco/002_bowl/model3/collision/bowl_collision_03.obj" scale="0.067164251827 0.067164251827 0.067164251827" />
+    <mesh name="bowl_collision_04" file="assets/mujoco/002_bowl/model3/collision/bowl_collision_04.obj" scale="0.067164251827 0.067164251827 0.067164251827" />
+    <mesh name="bowl_collision_05" file="assets/mujoco/002_bowl/model3/collision/bowl_collision_05.obj" scale="0.067164251827 0.067164251827 0.067164251827" />
+    <mesh name="bowl_collision_06" file="assets/mujoco/002_bowl/model3/collision/bowl_collision_06.obj" scale="0.067164251827 0.067164251827 0.067164251827" />
+    <mesh name="bowl_collision_07" file="assets/mujoco/002_bowl/model3/collision/bowl_collision_07.obj" scale="0.067164251827 0.067164251827 0.067164251827" />
+    <mesh name="bowl_collision_08" file="assets/mujoco/002_bowl/model3/collision/bowl_collision_08.obj" scale="0.067164251827 0.067164251827 0.067164251827" />
+    <mesh name="bowl_collision_09" file="assets/mujoco/002_bowl/model3/collision/bowl_collision_09.obj" scale="0.067164251827 0.067164251827 0.067164251827" />
+    <mesh name="bowl_collision_10" file="assets/mujoco/002_bowl/model3/collision/bowl_collision_10.obj" scale="0.067164251827 0.067164251827 0.067164251827" />
+    <mesh name="bowl_collision_11" file="assets/mujoco/002_bowl/model3/collision/bowl_collision_11.obj" scale="0.067164251827 0.067164251827 0.067164251827" />
+    <mesh name="bowl_collision_12" file="assets/mujoco/002_bowl/model3/collision/bowl_collision_12.obj" scale="0.067164251827 0.067164251827 0.067164251827" />
+    <mesh name="bowl_collision_13" file="assets/mujoco/002_bowl/model3/collision/bowl_collision_13.obj" scale="0.067164251827 0.067164251827 0.067164251827" />
+    <mesh name="bowl_collision_14" file="assets/mujoco/002_bowl/model3/collision/bowl_collision_14.obj" scale="0.067164251827 0.067164251827 0.067164251827" />
+    <mesh name="bowl_collision_15" file="assets/mujoco/002_bowl/model3/collision/bowl_collision_15.obj" scale="0.067164251827 0.067164251827 0.067164251827" />
+    <mesh name="bowl_collision_16" file="assets/mujoco/002_bowl/model3/collision/bowl_collision_16.obj" scale="0.067164251827 0.067164251827 0.067164251827" />
+    <mesh name="bowl_collision_17" file="assets/mujoco/002_bowl/model3/collision/bowl_collision_17.obj" scale="0.067164251827 0.067164251827 0.067164251827" />
+    <mesh name="bowl_collision_18" file="assets/mujoco/002_bowl/model3/collision/bowl_collision_18.obj" scale="0.067164251827 0.067164251827 0.067164251827" />
+    <mesh name="bowl_collision_19" file="assets/mujoco/002_bowl/model3/collision/bowl_collision_19.obj" scale="0.067164251827 0.067164251827 0.067164251827" />
+    <mesh name="bowl_collision_20" file="assets/mujoco/002_bowl/model3/collision/bowl_collision_20.obj" scale="0.067164251827 0.067164251827 0.067164251827" />
+    <mesh name="bowl_collision_21" file="assets/mujoco/002_bowl/model3/collision/bowl_collision_21.obj" scale="0.067164251827 0.067164251827 0.067164251827" />
+    <mesh name="bowl_collision_22" file="assets/mujoco/002_bowl/model3/collision/bowl_collision_22.obj" scale="0.067164251827 0.067164251827 0.067164251827" />
+    <mesh name="bowl_collision_23" file="assets/mujoco/002_bowl/model3/collision/bowl_collision_23.obj" scale="0.067164251827 0.067164251827 0.067164251827" />
+  </asset>
+  <worldbody>
+    <body name="block_1" pos="-0.18 -0.02 0.765">
+      <freejoint name="block_1_free" />
+      <geom name="block_1_collision_00" type="box" size="0.015 0.015 0.015" material="block_red" density="600" />
+    </body>
+    <body name="bowl_1" pos="0.2 -0.04 0.75">
+      <geom name="bowl_1_visual" type="mesh" mesh="bowl_visual" material="bowl_material" contype="0" conaffinity="0" group="2" />
+      <geom name="bowl_1_collision_00" type="mesh" mesh="bowl_collision_00" rgba="0 0 0 0" />
+      <geom name="bowl_1_collision_01" type="mesh" mesh="bowl_collision_01" rgba="0 0 0 0" />
+      <geom name="bowl_1_collision_02" type="mesh" mesh="bowl_collision_02" rgba="0 0 0 0" />
+      <geom name="bowl_1_collision_03" type="mesh" mesh="bowl_collision_03" rgba="0 0 0 0" />
+      <geom name="bowl_1_collision_04" type="mesh" mesh="bowl_collision_04" rgba="0 0 0 0" />
+      <geom name="bowl_1_collision_05" type="mesh" mesh="bowl_collision_05" rgba="0 0 0 0" />
+      <geom name="bowl_1_collision_06" type="mesh" mesh="bowl_collision_06" rgba="0 0 0 0" />
+      <geom name="bowl_1_collision_07" type="mesh" mesh="bowl_collision_07" rgba="0 0 0 0" />
+      <geom name="bowl_1_collision_08" type="mesh" mesh="bowl_collision_08" rgba="0 0 0 0" />
+      <geom name="bowl_1_collision_09" type="mesh" mesh="bowl_collision_09" rgba="0 0 0 0" />
+      <geom name="bowl_1_collision_10" type="mesh" mesh="bowl_collision_10" rgba="0 0 0 0" />
+      <geom name="bowl_1_collision_11" type="mesh" mesh="bowl_collision_11" rgba="0 0 0 0" />
+      <geom name="bowl_1_collision_12" type="mesh" mesh="bowl_collision_12" rgba="0 0 0 0" />
+      <geom name="bowl_1_collision_13" type="mesh" mesh="bowl_collision_13" rgba="0 0 0 0" />
+      <geom name="bowl_1_collision_14" type="mesh" mesh="bowl_collision_14" rgba="0 0 0 0" />
+      <geom name="bowl_1_collision_15" type="mesh" mesh="bowl_collision_15" rgba="0 0 0 0" />
+      <geom name="bowl_1_collision_16" type="mesh" mesh="bowl_collision_16" rgba="0 0 0 0" />
+      <geom name="bowl_1_collision_17" type="mesh" mesh="bowl_collision_17" rgba="0 0 0 0" />
+      <geom name="bowl_1_collision_18" type="mesh" mesh="bowl_collision_18" rgba="0 0 0 0" />
+      <geom name="bowl_1_collision_19" type="mesh" mesh="bowl_collision_19" rgba="0 0 0 0" />
+      <geom name="bowl_1_collision_20" type="mesh" mesh="bowl_collision_20" rgba="0 0 0 0" />
+      <geom name="bowl_1_collision_21" type="mesh" mesh="bowl_collision_21" rgba="0 0 0 0" />
+      <geom name="bowl_1_collision_22" type="mesh" mesh="bowl_collision_22" rgba="0 0 0 0" />
+      <geom name="bowl_1_collision_23" type="mesh" mesh="bowl_collision_23" rgba="0 0 0 0" />
+    </body>
+  </worldbody>
+  <keyframe>
+    <key name="v1_home" qpos="0 1.956977 1.601405 -1.215161 0 0 0.04 -0.04 -0.18 -0.02 0.765 1 0 0 0" ctrl="0 1.956977 1.601405 -1.215161 0 0 0.04" />
+  </keyframe>
+</mujoco>

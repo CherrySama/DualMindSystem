@@ -1,0 +1,23 @@
+<mujoco model="push_to_region">
+  <include file="common.xml" />
+  <default>
+    <default class="task_tool">
+      <geom rgba="0 0 0 0" contype="0" conaffinity="0" mass="0" group="4" />
+    </default>
+  </default>
+  <asset>
+    <material name="block_red" rgba="0.82 0.10 0.08 1" />
+  </asset>
+  <worldbody>
+    <body name="block_1" pos="-0.18 -0.05 0.765">
+      <freejoint name="block_1_free" />
+      <geom name="block_1_collision_00" type="box" size="0.015 0.015 0.015" material="block_red" density="600" />
+    </body>
+    <body name="target_region" pos="0.18 -0.05 0.751">
+      <geom name="target_region_marker" type="box" size="0.06 0.06 0.001" rgba="0.15 0.75 0.25 0.30" contype="0" conaffinity="0" group="2" />
+    </body>
+  </worldbody>
+  <keyframe>
+    <key name="v1_home" qpos="0 1.956977 1.601405 -1.215161 0 0 0.04 -0.04 -0.18 -0.05 0.765 1 0 0 0" ctrl="0 1.956977 1.601405 -1.215161 0 0 0.04" />
+  </keyframe>
+</mujoco>

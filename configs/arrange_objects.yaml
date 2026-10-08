@@ -1,0 +1,51 @@
+schema: MujocoFixedRgbdConfigV1
+scene_path: scenes/arrange_objects.xml
+keyframe_name: v1_home
+robot_base_body: panthera
+camera:
+  name: fixed_rgbd
+  type: rgbd
+  mounting: fixed
+  width: 640
+  height: 480
+  sensor_id: fixed_rgbd
+  calibration_id: sim_fixed_rgbd_v1
+entities:
+- track_id: block_1
+  segmentation_geom: block_1_collision_00
+  category: block
+  color: red
+  support_region_ref: table_surface
+- track_id: block_2
+  segmentation_geom: block_2_collision_00
+  category: block
+  color: blue
+  support_region_ref: table_surface
+- track_id: block_3
+  segmentation_geom: block_3_collision_00
+  category: block
+  color: yellow
+  support_region_ref: table_surface
+regions:
+- region_id: table_surface
+  region_type: surface
+  semantic_label: table
+  coordinate_frame: robot_base
+  boundary_xy_m:
+  - [0.7, -0.7]
+  - [0.7, 0.7]
+  - [-0.1, 0.7]
+  - [-0.1, -0.7]
+  surface_height_m: 0.0
+  surface_normal: [0.0, 0.0, 1.0]
+- region_id: storage_region
+  region_type: region_2d
+  semantic_label: storage_region
+  coordinate_frame: robot_base
+  boundary_xy_m:
+  - [0.4375, 0.02]
+  - [0.4375, 0.14]
+  - [0.2125, 0.14]
+  - [0.2125, 0.02]
+  surface_height_m: 0.0
+  surface_normal: [0.0, 0.0, 1.0]

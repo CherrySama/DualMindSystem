@@ -1,0 +1,24 @@
+<mujoco model="press_button">
+  <include file="common.xml" />
+  <default>
+    <default class="task_tool">
+      <geom material="robot_gray" contype="1" conaffinity="1" density="1000" group="0" />
+    </default>
+  </default>
+  <asset>
+    <material name="button_yellow" rgba="0.95 0.70 0.05 1" />
+    <material name="button_base_dark" rgba="0.16 0.16 0.18 1" />
+  </asset>
+  <worldbody>
+    <body name="button_1" pos="-0.12 -0.12 0.79">
+      <joint name="button_1_free" type="slide" axis="0 0 1" range="-0.015 0" damping="5" stiffness="1000" springref="0" />
+      <geom name="button_1_collision_00" type="cylinder" size="0.04 0.015" material="button_yellow" density="1000" />
+    </body>
+    <body name="button_base" pos="-0.12 -0.12 0.75">
+      <geom name="button_base_geom" type="cylinder" pos="0 0 0.0025" size="0.055 0.0025" material="button_base_dark" contype="1" conaffinity="1" />
+    </body>
+  </worldbody>
+  <keyframe>
+    <key name="v1_home" qpos="0 1.956977 1.601405 -1.215161 0 0 0.04 -0.04 0" ctrl="0 1.956977 1.601405 -1.215161 0 0 0.04" />
+  </keyframe>
+</mujoco>

@@ -1,0 +1,50 @@
+# 帽底参考零行程弹簧支撑面（0.025 m）；实际底座顶面为 0.005 m。
+schema: MujocoFixedRgbdConfigV1
+scene_path: scenes/press_button.xml
+keyframe_name: v1_home
+robot_base_body: panthera
+camera:
+  name: fixed_rgbd
+  type: rgbd
+  mounting: fixed
+  width: 640
+  height: 480
+  sensor_id: fixed_rgbd
+  calibration_id: sim_fixed_rgbd_v1
+entities:
+- track_id: button_1
+  entity_type: button
+  segmentation_geom: button_1_collision_00
+  category: large_button
+  color: yellow
+  support_region_ref: button_rest_surface
+regions:
+- region_id: table_surface
+  region_type: surface
+  semantic_label: table
+  coordinate_frame: robot_base
+  boundary_xy_m:
+  - [0.7, -0.7]
+  - [0.7, 0.7]
+  - [-0.1, 0.7]
+  - [-0.1, -0.7]
+  surface_height_m: 0.0
+  surface_normal: [0.0, 0.0, 1.0]
+- region_id: button_1_press_point
+  region_type: point
+  semantic_label: button_press_point
+  owner_entity_ref: button_1
+  coordinate_frame: robot_base
+  point_m: [0.42, -0.12, 0.055]
+  surface_normal: [0.0, 0.0, 1.0]
+- region_id: button_rest_surface
+  region_type: surface
+  semantic_label: spring_supported_cap_rest_surface
+  coordinate_frame: robot_base
+  boundary_xy_m:
+  - [0.475, -0.175]
+  - [0.475, -0.065]
+  - [0.365, -0.065]
+  - [0.365, -0.175]
+  surface_height_m: 0.025
+  surface_normal: [0.0, 0.0, 1.0]
