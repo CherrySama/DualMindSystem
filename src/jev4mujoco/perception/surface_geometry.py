@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from math import hypot
 
-from jev4mujoco.contracts.visual_scene import Polygon2, VisualPredicate
+from jev4mujoco.contracts.visual_scene import Polygon2
 
 
 Vec2 = tuple[float, float]
@@ -143,70 +143,3 @@ def footprint_clear_of_region_v1(
     return polygon_clearance_v1(footprint, region_boundary) >= required_clearance_m
 
 
-def surface_push_desired_inside_v1(
-    predicate: VisualPredicate,
-    desired_value: bool,
-) -> bool:
-    if predicate is VisualPredicate.IN_REGION and desired_value:
-        return True
-    if predicate is VisualPredicate.CLEAR_OF_REGION and desired_value:
-        return False
-    raise ValueError("unsupported surface-push goal relation")
-
-
-def polygon_center_v1(boundary: Polygon2) -> Vec2:
-    return (
-        sum(point[0] for point in boundary) / len(boundary),
-        sum(point[1] for point in boundary) / len(boundary),
-    )
-
-
-def surface_push_direction_v1(
-    subject_xy: Vec2,
-    reference_boundary: Polygon2,
-    desired_inside: bool,
-) -> Vec2:
-    """Return a goal direction, never a metric action or fixed trajectory."""
-    center = polygon_center_v1(reference_boundary)
-    dx = center[0] - subject_xy[0]
-    dy = center[1] - subject_xy[1]
-    if not desired_inside:
-        dx, dy = -dx, -dy
-    norm = hypot(dx, dy)
-    if norm <= 1.0e-9:
-        edge_midpoints = tuple(
-            (
-                0.5 * (reference_boundary[index - 1][0] + point[0]),
-                0.5 * (reference_boundary[index - 1][1] + point[1]),
-            )
-            for index, point in enumerate(reference_boundary)
-        )
-        nearest = min(
-            edge_midpoints,
-            key=lambda point: hypot(
-                point[0] - subject_xy[0], point[1] - subject_xy[1]
-            ),
-        )
-        dx = nearest[0] - subject_xy[0]
-        dy = nearest[1] - subject_xy[1]
-        norm = hypot(dx, dy)
-    if norm <= 1.0e-9:
-        raise ValueError("surface push goal direction is geometrically undefined")
-    return dx / norm, dy / norm
-
-
-def surface_push_precontact_xy_v1(
-    subject_xy: Vec2,
-    subject_extent_xy: Vec2,
-    direction_xy: Vec2,
-    clearance_m: float,
-) -> Vec2:
-    projected_half_extent = 0.5 * (
-        abs(direction_xy[0]) * subject_extent_xy[0]
-        + abs(direction_xy[1]) * subject_extent_xy[1]
-    )
-    offset = projected_half_extent + clearance_m
-    return (
-        subject_xy[0] - direction_xy[0] * offset,
-        subject_xy[1] - direction_xy[1] * offset,
-    )

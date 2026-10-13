@@ -48,7 +48,14 @@ class TypeSafeClient:
 
     def query(self, body: dict[str, Any]) -> object:
         started = time.perf_counter()
-        self.last_call = {"attempts": 0, "http_status": None, "error": None}
+        state = body.get("state", {})
+        phase = state.get("phase", {}) if isinstance(state, dict) else {}
+        self.last_call = {"attempts": 0, "http_status": None, "error": None,
+            "request_summary": {"model": body.get("model"),
+                "state_schema": state.get("schema") if isinstance(state, dict) else None,
+                "state_id": state.get("state_id") if isinstance(state, dict) else None,
+                "action_epoch": state.get("action_epoch") if isinstance(state, dict) else None,
+                "phase_id": phase.get("phase_id") if isinstance(phase, dict) else None}}
         try:
             return self._query(body)
         finally:
@@ -74,6 +81,7 @@ class TypeSafeClient:
                 continue
 
             self.last_call["http_status"] = response.status_code
+            self.last_call["request_summary"]["body_bytes"] = len(response.request.content)
             if (
                 response.status_code in RETRYABLE_HTTP_STATUS
                 and attempt < self._retries
@@ -82,6 +90,9 @@ class TypeSafeClient:
                 continue
             if response.status_code != 200:
                 self.last_call["error"] = f"http_{response.status_code}"
+                # 只记录正文与摘要，不记录认证头；正文中出现当前凭据时脱敏。
+                self.last_call["error_body"] = response.text.replace(self._api_key, "[redacted]")[:16000]
+                self.last_call["error_body_truncated"] = len(response.text) > 16000
                 raise TypeSafeClientError(
                     f"TypeSafe returned HTTP {response.status_code}; no action executed"
                 )

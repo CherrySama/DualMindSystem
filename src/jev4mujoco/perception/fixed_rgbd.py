@@ -11,7 +11,7 @@ import numpy as np
 from numpy.typing import NDArray
 import yaml
 
-from jev4mujoco.perception.surface_geometry import footprint_clear_of_region_v1
+from jev4mujoco.perception.surface_geometry import footprint_clear_of_region_v1, polygon_clearance_v1
 from jev4mujoco.perception.relations import (
     VisualRelationConfigV1,
     derive_entity_relations_v1,
@@ -19,6 +19,7 @@ from jev4mujoco.perception.relations import (
 from jev4mujoco.contracts.visual_scene import (
     EntityGeometryV1,
     EntityMeasurementV1,
+    EntityVisibilityDiagnosticV1,
     EntitySemanticV1,
     EntityType,
     EntityV1,
@@ -56,6 +57,7 @@ class MujocoRgbdEntitySpecV1:
     color: str
     support_region_ref: str
     entity_type: EntityType = EntityType.MOVABLE_OBJECT
+    additional_support_region_refs: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         for name, value in (
@@ -67,6 +69,12 @@ class MujocoRgbdEntitySpecV1:
         ):
             if not value.strip():
                 raise ValueError(f"{name} must be a non-empty string")
+        if (len(self.additional_support_region_refs) != len(set(self.additional_support_region_refs))
+            or self.support_region_ref in self.additional_support_region_refs):
+            raise ValueError("additional support regions must be unique and exclude initial support")
+        for reference in self.additional_support_region_refs:
+            if not reference.strip():
+                raise ValueError("additional support region must be a non-empty string")
 
 
 @dataclass(frozen=True, slots=True)
@@ -196,6 +204,7 @@ class MujocoFixedRgbdVisualSceneBuilderV1:
         self._calibrated_regions = calibrated_regions
         self._tracked_extent_z_m: dict[str, float] = {}
         self._tracked_min_block_span_m: dict[str, float] = {}
+        self._tracked_span_origin: dict[str, tuple[str, int, float]] = {}
 
         self._camera_id = self._require_named_id(
             mujoco.mjtObj.mjOBJ_CAMERA, camera_name
@@ -203,6 +212,13 @@ class MujocoFixedRgbdVisualSceneBuilderV1:
         self._robot_base_body_id = self._require_named_id(
             mujoco.mjtObj.mjOBJ_BODY, robot_base_body_name
         )
+        # 静态机器人类别归属；当前邻接只从同帧分割获取，不读物体位姿。
+        robot_bodies = {self._robot_base_body_id}
+        for body_id in range(self._robot_base_body_id + 1, model.nbody):
+            if int(model.body_parentid[body_id]) in robot_bodies:
+                robot_bodies.add(body_id)
+        self._robot_geom_ids = tuple(i for i in range(model.ngeom)
+            if int(model.geom_bodyid[i]) in robot_bodies)
         self._geom_ids = {
             spec.track_id: self._require_named_id(
                 mujoco.mjtObj.mjOBJ_GEOM, spec.geom_name
@@ -221,6 +237,22 @@ class MujocoFixedRgbdVisualSceneBuilderV1:
                     f"entity {spec.track_id} references unknown support region "
                     f"{spec.support_region_ref}"
                 )
+            for reference in spec.additional_support_region_refs:
+                region = next((r for r in calibrated_regions if r.region_id == reference), None)
+                if region is None:
+                    raise ValueError(f"entity {spec.track_id} references unknown support region {reference}")
+                if (region.owner_entity_ref is not None
+                    or region.region_type not in (RegionType.SURFACE, RegionType.REGION_2D)):
+                    raise ValueError("additional support region must be a fixed calibrated surface")
+            supports = [next(r for r in calibrated_regions if r.region_id == reference)
+                        for reference in (spec.support_region_ref, *spec.additional_support_region_refs)]
+            for index, left in enumerate(supports):
+                for right in supports[index+1:]:
+                    if (left.surface_height_robot_base_m == right.surface_height_robot_base_m
+                        and left.boundary_xy_robot_base_m is not None
+                        and right.boundary_xy_robot_base_m is not None
+                        and polygon_clearance_v1(left.boundary_xy_robot_base_m, right.boundary_xy_robot_base_m) <= 0):
+                        raise ValueError("coplanar physical support regions must not overlap")
 
         if (
             int(model.cam_projection[self._camera_id])
@@ -291,6 +323,8 @@ class MujocoFixedRgbdVisualSceneBuilderV1:
         region_by_id = {region.region_id: region for region in regions}
         entities: list[EntityV1] = []
         entity_points: dict[str, NDArray[np.float64]] = {}
+        robot_mask = np.isin(instance_segmentation[:, :, 0], self._robot_geom_ids) & (
+            instance_segmentation[:, :, 1] == mujoco.mjtObj.mjOBJ_GEOM.value)
         for spec in self._entity_specs:
             mask = self._geom_mask(instance_segmentation, self._geom_ids[spec.track_id])
             points = self._back_project_mask_to_robot_base(
@@ -308,6 +342,10 @@ class MujocoFixedRgbdVisualSceneBuilderV1:
                     mask_pixel_count=int(mask.sum()),
                     points_robot_base_m=points,
                     support_region=region_by_id[spec.support_region_ref],
+                    additional_support_regions=tuple(region_by_id[ref]
+                        for ref in spec.additional_support_region_refs),
+                    observation_binding=(scene_id, observation_id, capture_timestamp),
+                    robot_adjacent_pixel_count=self._robot_adjacent_pixel_count(mask, robot_mask),
                     xy_span_uncertainty_m=(0.0 if not len(points) else
                         2 * sqrt(2) * float(np.max(np.linalg.norm(points - np.einsum(
                             "ji,j->i", base_rotation_world_from_base,
@@ -370,6 +408,17 @@ class MujocoFixedRgbdVisualSceneBuilderV1:
         if object_id < 0:
             raise ValueError(f"MuJoCo {object_type.name} named {name!r} does not exist")
         return object_id
+
+    @staticmethod
+    def _robot_adjacent_pixel_count(mask, robot_mask) -> int:
+        """可见对象像素的8邻域内机器人像素数；邻接不是遮挡因果证明。"""
+        padded = np.pad(mask, 1)
+        neighbors = np.zeros_like(mask)
+        for dy in range(3):
+            for dx in range(3):
+                if (dy, dx) != (1, 1):
+                    neighbors |= padded[dy:dy + mask.shape[0], dx:dx + mask.shape[1]]
+        return int(np.count_nonzero(neighbors & robot_mask))
 
     @staticmethod
     def _geom_mask(segmentation: SegmentationImage, geom_id: int) -> NDArray[np.bool_]:
@@ -489,7 +538,10 @@ class MujocoFixedRgbdVisualSceneBuilderV1:
         mask_pixel_count: int,
         points_robot_base_m: NDArray[np.float64],
         support_region: RegionV1,
+        additional_support_regions: tuple[RegionV1, ...] = (),
         xy_span_uncertainty_m: float = 0.0,
+        observation_binding: tuple[str, int, float] | None = None,
+        robot_adjacent_pixel_count: int = 0,
     ) -> EntityV1:
         valid_count = int(points_robot_base_m.shape[0])
         valid_fraction = valid_count / mask_pixel_count if mask_pixel_count else 0.0
@@ -540,17 +592,23 @@ class MujocoFixedRgbdVisualSceneBuilderV1:
                 (float(xy_max[0]), float(xy_max[1])),
                 (float(xy_min[0]), float(xy_max[1])),
             )
-            support_boundary = support_region.geometry.boundary_xy_robot_base_m
-            assert support_boundary is not None and support_boundary.value is not None
-            inside_support = all(
-                self._point_in_polygon(point, support_boundary.value)
-                for point in footprint
-            )
             bottom_z = center_z - 0.5 * height
-            supported = inside_support and abs(
-                bottom_z - calibrated_support_height
-            ) <= 0.01
-            current_support_ref = spec.support_region_ref if supported else None
+            # Known fixed surfaces may cover the initial plane (e.g. thin mats).
+            # Use current RGB-D footprint/bottom and the highest containing
+            # physical surface; this is geometry-based support, never contact truth.
+            candidates = []
+            for region in (support_region, *additional_support_regions):
+                boundary = region.geometry.boundary_xy_robot_base_m
+                surface_height = region.geometry.surface_height_robot_base_m
+                if (boundary is None or boundary.value is None
+                    or surface_height is None or surface_height.value is None):
+                    continue
+                if (abs(bottom_z - surface_height.value) <= 0.01
+                    and all(self._point_in_polygon(point, boundary.value) for point in footprint)):
+                    candidates.append((surface_height.value, region.region_id))
+            highest = max((item[0] for item in candidates), default=None)
+            highest_refs = [ref for height_m, ref in candidates if height_m == highest]
+            current_support_ref = highest_refs[0] if len(highest_refs) == 1 else None
             derived = lambda value: EvidenceValueV1(  # noqa: E731
                 value=value, status=EvidenceStatus.DERIVED, confidence=1.0
             )
@@ -576,12 +634,29 @@ class MujocoFixedRgbdVisualSceneBuilderV1:
                 if reference_span is None:
                     # Conservative first-frame lower bound for the current upright blocks.
                     self._tracked_min_block_span_m[spec.track_id] = min(extent)
+                    if observation_binding is not None:
+                        self._tracked_span_origin[spec.track_id] = observation_binding
                 elif min(extent[:2]) + xy_span_uncertainty_m < reference_span:
                     # Visible fragments cannot certify the whole footprint or its centroid.
                     visibility = Visibility.PARTIAL
                     geometry = EntityGeometryV1(unobservable, unobservable, unobservable,
                         unobservable, unobservable, unobservable)
                     current_support_ref = None
+
+        diagnostic = None
+        if observation_binding is not None:
+            scene_id, observation_id, timestamp = observation_binding
+            origin = self._tracked_span_origin.get(spec.track_id)
+            reference = self._tracked_min_block_span_m.get(spec.track_id)
+            span = None if valid_count < 4 else (float(xy_max[0] - xy_min[0]), float(xy_max[1] - xy_min[1]))
+            bounds = None if span is None else (tuple(map(float, xy_min)), tuple(map(float, xy_max)))
+            diagnostic = EntityVisibilityDiagnosticV1(scene_id, observation_id, float(timestamp), valid_count,
+                bounds, span, robot_adjacent_pixel_count, "mujoco_ideal_robot_segmentation",
+                reference, None if origin is None else origin[0], None if origin is None else origin[1],
+                None if origin is None else origin[2], float(xy_span_uncertainty_m),
+                None if span is None or reference is None else max(0.0, float(reference) - min(span) - float(xy_span_uncertainty_m)),
+                {Visibility.CLEAR: "original_geometry_criterion_satisfied", Visibility.PARTIAL: "visible_span_below_reference",
+                 Visibility.NOT_DETECTED: "insufficient_valid_points"}[visibility])
 
         return EntityV1(
             track_id=spec.track_id,
@@ -596,6 +671,7 @@ class MujocoFixedRgbdVisualSceneBuilderV1:
             measurement=EntityMeasurementV1(
                 method="rgbd_instance_mask_depth_backprojection",
                 depth_valid_fraction=valid_fraction,
+                visibility_diagnostic=diagnostic,
             ),
         )
 
@@ -769,6 +845,9 @@ def load_mujoco_fixed_rgbd_config_v1(path: str | Path) -> MujocoFixedRgbdConfigV
     entity_items = required(raw, "entities")
     if not isinstance(entity_items, list) or not entity_items:
         raise ValueError("entities must be a non-empty YAML list")
+    for item in entity_items:
+        if not isinstance(item.get("additional_support_region_refs", []), list):
+            raise ValueError("additional_support_region_refs must be a YAML list")
     entity_specs = tuple(
         MujocoRgbdEntitySpecV1(
             track_id=str(required(item, "track_id")),
@@ -779,6 +858,8 @@ def load_mujoco_fixed_rgbd_config_v1(path: str | Path) -> MujocoFixedRgbdConfigV
             entity_type=EntityType(
                 str(item.get("entity_type", EntityType.MOVABLE_OBJECT.value))
             ),
+            additional_support_region_refs=tuple(str(reference)
+                for reference in item.get("additional_support_region_refs", [])),
         )
         for item in entity_items
     )

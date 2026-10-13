@@ -7,7 +7,6 @@ from __future__ import annotations
 
 from math import hypot, sqrt
 import numpy as np
-from numpy.typing import NDArray
 from jev4mujoco.contracts.actions import RawStateSnapshot
 from jev4mujoco.perception.surface_geometry import (
     footprint_clear_of_region_v1,
@@ -105,7 +104,7 @@ def evaluate_pick_and_place(self, raw: RawStateSnapshot) -> HiddenTruthResultV1:
 
 
 def evaluate_multi_object_regions(
-    self, destinations: dict[str, str]
+    self, destinations: dict[str, str], *, support_geoms_by_region: dict[str, str] | None = None,
 ) -> MultiObjectHiddenTruthResultV1:
     regions = {
         region.region_id: region
@@ -121,12 +120,19 @@ def evaluate_multi_object_regions(
         speed = sqrt(
             sum(value * value for value in current.bowl_linear_velocity_world_mps)
         )
+        if support_geoms_by_region is None:
+            supported = _table_supported(self, current, subject_ref)
+        else:
+            minimum, _ = _box_bounds(self, subject_ref, current)
+            height = regions[target_ref].surface_height_robot_base_m
+            supported = (height is not None and abs(minimum[2] - height) <= 0.006
+                and self.backend.evaluation_object_support_contact(subject_ref, support_geoms_by_region[target_ref]))
         results.append(
             ObjectRegionTruthV1(
                 subject_ref=subject_ref,
                 target_ref=target_ref,
                 footprint_inside_target=inside,
-                supported=_table_supported(self, current, subject_ref),
+                supported=supported,
                 stable=speed <= 0.01,
                 fingers_clear=not (
                     current.contacts.left_finger_bowl_contact
@@ -161,18 +167,6 @@ def evaluate_multi_object_regions(
             if not failed
             else f"failed hidden checks: {', '.join(failed)}"
         ),
-    )
-
-
-def quaternion_rotation(quaternion_wxyz: tuple[float, float, float, float]) -> NDArray[np.float64]:
-    w, x, y, z = quaternion_wxyz
-    return np.asarray(
-        [
-            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
-            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
-            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
-        ],
-        dtype=np.float64,
     )
 
 
@@ -354,8 +348,9 @@ def evaluate_relative_placement(
 
 def evaluate_arrangement(self, raw: RawStateSnapshot) -> ArrangementHiddenTruthResultV1:
     del raw
-    base = self._multi_object_region_hidden_truth(
-        self._arrangement_destinations
+    base = evaluate_multi_object_regions(
+        self, self._arrangement_destinations,
+        support_geoms_by_region=self._arrangement_support_geoms,
     )
     centers: list[tuple[float, float, float]] = []
     footprints = []
@@ -363,9 +358,9 @@ def evaluate_arrangement(self, raw: RawStateSnapshot) -> ArrangementHiddenTruthR
         current = self.backend.select_active_object(subject_ref)
         centers.append(current.bowl_position_robot_base_m)
         footprints.append(_box_footprint(self, subject_ref))
-    row_cross_span = max(center[1] for center in centers) - min(
-        center[1] for center in centers
-    )
+    row_projection = [sum(center[i] * self._arrangement_cross_axis[i] for i in (0, 1))
+                      for center in centers]
+    row_cross_span = max(row_projection) - min(row_projection)
     minimum_clearance = min(
         polygon_clearance_v1(footprints[index], footprints[other])
         for index in range(len(footprints))
@@ -519,7 +514,10 @@ def evaluate_inside_bowl(
 
 def evaluate_button_press(self, raw: RawStateSnapshot) -> ButtonPressHiddenTruthResultV1:
     travel = self._initial_button_center_z - raw.bowl_position_robot_base_m[2]
-    travel_reached = travel >= self._verifier_config.press_minimum_travel_m
+    observed, peak_travel, occurred_at = self._button_press_judge.evaluate(
+        event.payload for event in self._events if event.kind == "action_result")
+    error = self.backend.evaluation_observer_error
+    travel_reached = observed and error is None
     effector_contact = (
         raw.contacts.left_finger_bowl_contact
         or raw.contacts.right_finger_bowl_contact
@@ -542,23 +540,22 @@ def evaluate_button_press(self, raw: RawStateSnapshot) -> ButtonPressHiddenTruth
         )
         <= self._verifier_config.surface_push_gripper_position_tolerance_m
     )
-    checks = {
-        "travel_reached": travel_reached,
-        "effector_contact": effector_contact,
-        "button_supported": supported,
-        "button_stable": stable,
-        "gripper_closed": gripper_closed,
-    }
+    # 终态接触、稳定及夹爪只作独立诊断；按压目标是已发生的事件。
+    checks = {"press_event_observed": travel_reached}
     failed = [name for name, passed in checks.items() if not passed]
     return ButtonPressHiddenTruthResultV1(
         success=not failed,
-        press_travel_m=travel,
+        press_travel_m=peak_travel,
         travel_reached=travel_reached,
         effector_contact=effector_contact,
         button_supported=supported,
         button_stable=stable,
         gripper_closed=gripper_closed,
-        reason="all hidden checks passed" if not failed else ", ".join(failed),
+        reason=(f"evaluation trajectory unavailable: {error}" if error else
+            "physical press event observed" if not failed else ", ".join(failed)),
+        press_event_observed=travel_reached,
+        event_timestamp_s=occurred_at,
+        final_press_travel_m=travel,
     )
 
 

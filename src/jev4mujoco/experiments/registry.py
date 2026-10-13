@@ -76,7 +76,7 @@ EXPERIMENTS_V1: dict[str, ExperimentSpecV1] = {
         runtime_type=MultiBlockArrangeRuntimeV1,
         run_name='v1_three_block_arrange',
         maximum_decisions=320,
-        result_task='arrange_three_blocks_in_a_row',
+        result_task='arrange_red_yellow_blue_on_pads',
     ),
     'stack': ExperimentSpecV1(
         runtime_type=MultiBlockStackRuntimeV1,

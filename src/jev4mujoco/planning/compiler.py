@@ -118,10 +118,14 @@ def compile_repeated_region_placement_capabilities_v1(
             for subject_ref in plan.task.subjects.initial_binding.track_ids
         )
     elif isinstance(plan.task, ArrangeObjectsTaskV1):
-        assignments.extend(
-            (subject_ref, plan.task.workspace.region_ref)
-            for subject_ref in plan.task.subjects.initial_binding.track_ids
-        )
+        if plan.task.slot_assignments:
+            assignments.extend((item.subject_ref, item.destination.region_ref)
+                               for item in plan.task.slot_assignments)
+        else:
+            assignments.extend(
+                (subject_ref, plan.task.workspace.region_ref)
+                for subject_ref in plan.task.subjects.initial_binding.track_ids
+            )
     else:
         raise ValueError(
             "repeated region placement compiler supports sort, clear, and arrange tasks"

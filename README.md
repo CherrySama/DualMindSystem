@@ -1,36 +1,49 @@
-# DualMindSystem
+# JEV4Mujoco
 
-这是当前的 JEV4MuJoCo 研究仓库：预设任务计划生成 `TaskPlanV1`，JEV 根据当前阶段和新鲜观测选择一个原子动作，Runtime 负责阶段状态、条件与完成判定，MuJoCo 执行器负责实际运动。当前还没有接入负责高层语义规划的 LLM；这个分工仍处于架构设计阶段。
+Panthera 桌面操作的 MuJoCo 仿真框架。当前链路为：预设指令与首帧视觉 → TaskPlan → 五类通用能力 → JEV 局部意图与动作 → Runtime 审查、执行与独立核验。
 
-## 当前状态
+最新同版、两层 JEV、零任务恢复复测：**10/12 完整自主成功**；按压效果成功但执行超时，效果双确认合计 **11/12**。堆叠正式回合接口中止，同版独立补测执行正常但未形成堆叠。记录对应清理前冻结版本，不能视为十二类稳定全通过。见[复测报告](docs/full_twelve_retest_20261013.md)。
 
-2026-10-08 的十二类任务首次执行复测为 **1/12**。唯一通过的是单方块抓取，不能据此宣称抓取能力已经可靠。其余结果被区分为：
+高层 LLM、真实视觉识别、统一 retry 与现实时间闭环尚未完成。在线输入限定为 RGB-D、关节位置/速度、估计力矩、控制指令、夹爪位置和校准参数；隐藏仿真物体/接触真值仅供独立裁判。当前实例掩码与类别/颜色语义仍使用理想仿真适配器。见[当前架构](docs/current_stage_plan.md)与[真实反馈契约](docs/real_robot_feedback_contract.md)。
 
-- 搬运对齐和持有证据在部分任务中反复失效；
-- 两个推动任务在接触意图请求处收到 HTTP 400，服务端具体原因尚未由客户端正文确认；
-- 按压仍复现执行器位置未收敛问题；
-- 清理任务出现视觉几何运行异常。
+## 运行
 
-因此，当前成功率不能简单归因于 JEV，也不能把 HTTP 400 或未充分执行的回合当成完整物理能力失败。最新证据见 [首次执行复测](docs/first_execution_retest_20261008.md)。接口边界和架构分工见 [System2/System1/Runtime 评审](docs/system2_system1_runtime_review_20261006.md)；输入冗余与接触表达修复见 [公共信息复测](docs/common_information_retest_20261008.md) 和 [接触输入压缩](docs/contact_input_compaction_round1_20261008.md)。
-
-## 安装与运行
+使用现有 `jev-mujoco` 环境，JEV 凭证通过 `.env` 或环境变量加载，格式见 [.env.example](.env.example)。
 
 ```bash
 conda activate jev-mujoco
-python -m pip install -r requirements-assets.txt
-python assets/download_objects.py
 python scripts/run_v1.py --help
-python scripts/run_v1.py --task pick_and_place
-python scripts/run_v1.py --tasks all --episodes 1
+python scripts/run_v1.py --task pick --maximum-retries 0 --jev-stages 2
+python scripts/run_v1.py --tasks all --episodes 1 --maximum-retries 0 --jev-stages 2
 ```
 
-大型 RoboTwin 对象库不会提交到 GitHub。下载脚本从 `TianxingChen/RoboTwin2.0` 获取 `objects.zip`，解压到 `assets/objects/`，完成后删除压缩包并写入完成标记。`assets/mujoco/` 中的 OBJ 是当前 MuJoCo 场景直接引用的转换网格；两者格式和职责不同，不能直接互换。
+支持 `pick`、`pick_and_place`、`sort`、`clear`、`relative`、`push_to_region`、`push_aside`、`arrange`、`stack`、`bowl`、`press`、`ordered`。使用 `--tasks pick stack` 选择子集，或 `--task stack --episodes N` 重复单个实验。每类场景与 RGB-D 配置分别位于 `scenes/` 和 `configs/`；公共机器人配置在 `scenes/common.xml`。
 
-每次运行的事件、请求、结果和视频保存在 `runs/`，该目录被 Git 忽略。完整任务映射见 [当前阶段计划](docs/current_stage_plan.md)，代码入口见 [scripts/run_v1.py](scripts/run_v1.py)。
+示例显式关闭任务恢复并选择两层 JEV；程序默认仍是 `--maximum-retries 5`、`--jev-stages 1`。已有恢复入口保留现场并重启当前能力/抓放链，尚未形成统一恢复策略。客户端请求重试与任务恢复分别统计。
 
-## 当前边界
+每回合保存事件、计划、结果、统计和完整视频；批次位于 `runs/batches/jev_*/`，包含冻结版本清单、逐回合统计与报告。只有 Runtime 和独立裁判同时通过时才使用成功视频名称，执行异常仍单列。`runs/` 被 Git 忽略，本机证据不会随代码上传。
 
-- Runtime 的验证与隐藏物理验收保持分离，隐藏真值不回流给 JEV；
-- 当前接触、抓持和支撑证据仍包含 MuJoCo 接触读数，尚未证明为纯 RGB-D/机器人反馈的真机闭环；
-- 重试、高层 LLM、自由任务规划和完整接触力估计暂不作为已实现能力；
-- 所有新增成功率都必须来自完整任务回合，冻结输入重放和局部探针不计入任务成功率。
+## 离线回归
+
+```bash
+PYTHONPATH=src:. PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -s tests -v
+```
+
+428 个用例按 15 个功能模块组织，另有一个共享几何夹具文件与两份数据夹具。覆盖契约、规划、感知、仿真执行、Runtime 阶段与恢复、JEV、抓取、搬运、放置、推动、按压及客户端。离线回归不发送在线模型请求，通过也不等于在线可靠性或真实机器人验证。
+
+## 代码阅读入口
+
+| 职责 | 入口 |
+| --- | --- |
+| 实验运行与装配 | [run_v1.py](scripts/run_v1.py)、[registry.py](src/jev4mujoco/experiments/registry.py)、[scenarios.py](src/jev4mujoco/experiments/scenarios.py) |
+| 视觉、任务、状态契约 | [contracts](src/jev4mujoco/contracts) |
+| 预设计划与能力编译 | [planning](src/jev4mujoco/planning) |
+| JEV 决策与模型客户端 | [policies](src/jev4mujoco/policies) |
+| 状态融合、阶段与动作验证 | [runtime](src/jev4mujoco/runtime) |
+| RGB-D 重建及几何 | [perception](src/jev4mujoco/perception) |
+| MuJoCo 后端与执行器 | [simulation](src/jev4mujoco/simulation) |
+| 批次统计与独立裁判 | [experiments](src/jev4mujoco/experiments) |
+
+`panthera_python/` 保留完整 Panthera Python SDK。对象资源位于被忽略的 `assets/objects/`；需要恢复资源时，先安装 `requirements-assets.txt`，再运行 `python assets/download_objects.py`。下载来源与解压规则见[资源脚本](assets/download_objects.py)，本轮整理不触发下载。
+
+项目当前已关联现有 GitHub 仓库；本轮仅本地整理，没有提交或推送。文档收敛为六份，历史修复文档与旧测试原文件移出项目归档，最新完整批次及堆叠补测保留。见[文档索引](docs/README.md)、[清理记录](docs/cleanup_20261013.md)和[后续交接](docs/next_conversation_handoff_20261013.md)。

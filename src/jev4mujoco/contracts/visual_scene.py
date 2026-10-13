@@ -173,9 +173,76 @@ class EntityGeometryV1:
 
 
 @dataclass(frozen=True, slots=True)
+class EntityVisibilityDiagnosticV1:
+    """当前可见片段的诊断；不提供完整物体位姿或遮挡因果证明。"""
+    scene_id: str
+    observation_id: int
+    capture_timestamp_s: float
+    valid_point_count: int
+    visible_xy_bounds_robot_base_m: tuple[Vec2, Vec2] | None
+    visible_xy_span_m: Vec2 | None
+    robot_adjacent_pixel_count: int
+    robot_mask_source: str
+    reference_minimum_span_m: float | None
+    reference_scene_id: str | None
+    reference_observation_id: int | None
+    reference_capture_timestamp_s: float | None
+    xy_span_uncertainty_m: float
+    span_deficit_m: float | None
+    reason: str
+
+    def __post_init__(self) -> None:
+        for name in ("scene_id", "robot_mask_source", "reason"):
+            _require_identifier(getattr(self, name), name)
+        for name in ("observation_id", "valid_point_count", "robot_adjacent_pixel_count"):
+            value = getattr(self, name)
+            if type(value) is not int or value < 0:
+                raise ValueError(f"{name} must be a nonnegative integer")
+        for name in ("capture_timestamp_s", "xy_span_uncertainty_m", "reference_minimum_span_m",
+                     "reference_capture_timestamp_s", "span_deficit_m"):
+            value = getattr(self, name)
+            if value is not None and (not isfinite(value) or value < 0):
+                raise ValueError(f"{name} must be finite and nonnegative")
+        if self.reference_observation_id is not None and (
+            type(self.reference_observation_id) is not int or self.reference_observation_id < 0):
+            raise ValueError("reference_observation_id must be a nonnegative integer")
+        if (self.reference_observation_id is None) != (self.reference_capture_timestamp_s is None):
+            raise ValueError("reference observation and timestamp must be provided together")
+        if (self.reference_scene_id is None) != (self.reference_observation_id is None):
+            raise ValueError("reference scene and observation must be provided together")
+        if self.reference_scene_id is not None:
+            _require_identifier(self.reference_scene_id, "reference_scene_id")
+        if self.reference_capture_timestamp_s is not None and (
+            self.reference_minimum_span_m is None
+            or self.reference_capture_timestamp_s > self.capture_timestamp_s
+            or (self.reference_scene_id == self.scene_id and self.reference_observation_id > self.observation_id)):
+            raise ValueError("reference must identify an earlier or current span measurement")
+        if (self.visible_xy_span_m is None) != (self.visible_xy_bounds_robot_base_m is None):
+            raise ValueError("visible fragment span and bounds must be provided together")
+        if self.visible_xy_span_m is not None:
+            _require_vector(self.visible_xy_span_m, 2, "visible_xy_span_m")
+            if len(self.visible_xy_bounds_robot_base_m) != 2:
+                raise ValueError("visible fragment bounds must have minimum and maximum XY")
+            low, high = self.visible_xy_bounds_robot_base_m
+            _require_vector(low, 2, "visible_xy_minimum")
+            _require_vector(high, 2, "visible_xy_maximum")
+            if any(span < 0 or abs(high[i] - low[i] - span) > 1e-12
+                   for i, span in enumerate(self.visible_xy_span_m)):
+                raise ValueError("visible fragment bounds and span disagree")
+        if self.span_deficit_m is not None:
+            if self.reference_minimum_span_m is None or self.visible_xy_span_m is None:
+                raise ValueError("span deficit requires reference and current fragment")
+            expected = max(0.0, self.reference_minimum_span_m - min(self.visible_xy_span_m)
+                           - self.xy_span_uncertainty_m)
+            if abs(self.span_deficit_m - expected) > 1e-12:
+                raise ValueError("span deficit must follow the original visibility criterion")
+
+
+@dataclass(frozen=True, slots=True)
 class EntityMeasurementV1:
     method: str
     depth_valid_fraction: float
+    visibility_diagnostic: EntityVisibilityDiagnosticV1 | None = None
 
     def __post_init__(self) -> None:
         _require_identifier(self.method, "measurement.method")

@@ -57,6 +57,7 @@ class ActionRequest:
     based_on_action_epoch: int
     action: AtomicAction
     translation_step_m: float | None = None
+    held_object_estimate: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)

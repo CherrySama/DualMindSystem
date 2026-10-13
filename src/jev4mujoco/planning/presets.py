@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 from jev4mujoco.contracts.task_plan import (
     ArrangementOrdering,
     ArrangementPattern,
     ArrangeObjectsTaskV1,
+    ArrangementSlotAssignmentV1,
     ClearRegionTaskV1,
     EntitySelectorV1,
     EntitySetV1,
@@ -390,6 +393,40 @@ def build_preset_row_arrangement_plan_v1(
             ordering=ArrangementOrdering.ANY,
         ),
     )
+    validate_task_plan_v1(plan, initial_scene)
+    return plan
+
+
+def build_preset_color_slot_arrangement_plan_v1(
+    *,
+    task_id: str,
+    instruction: str,
+    initial_scene: VisualSceneV1,
+    color_order: tuple[str, ...],
+    ordered_slot_refs: tuple[str, ...],
+    workspace_ref: str,
+) -> TaskPlanV1:
+    """Ground a supplied color/slot order in the initial visible scene."""
+    if (len(color_order) < 2 or len(color_order) != len(ordered_slot_refs)
+        or len(color_order) != len(set(color_order))):
+        raise ValueError("color arrangement requires unique colors and one slot per color")
+    subjects = []
+    for color in color_order:
+        matches = tuple(entity for entity in initial_scene.entities
+            if entity.entity_type is EntityType.MOVABLE_OBJECT
+            and entity.visibility is Visibility.CLEAR
+            and entity.semantic.category.value == "block"
+            and entity.semantic.color.value == color)
+        if len(matches) != 1:
+            raise ValueError(f"arrangement color {color} must identify exactly one visible block")
+        subjects.append(matches[0].track_id)
+    plan = build_preset_row_arrangement_plan_v1(
+        task_id=task_id, instruction=instruction, initial_scene=initial_scene,
+        subject_refs=tuple(subjects), workspace_ref=workspace_ref)
+    plan = replace(plan, task=replace(plan.task,
+        ordering=ArrangementOrdering.ASSIGNED_SLOTS,
+        slot_assignments=tuple(ArrangementSlotAssignmentV1(subject, RegionRefV1(slot, RegionType.REGION_2D))
+                               for subject, slot in zip(subjects, ordered_slot_refs))))
     validate_task_plan_v1(plan, initial_scene)
     return plan
 

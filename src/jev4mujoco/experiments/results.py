@@ -156,6 +156,9 @@ class ButtonPressHiddenTruthResultV1:
     button_stable: bool
     gripper_closed: bool
     reason: str
+    press_event_observed: bool | None = None
+    event_timestamp_s: float | None = None
+    final_press_travel_m: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -191,3 +194,6 @@ class BlockRuntimeOutcomeV1:
     final_state: StateSnapshotV2
     final_raw_state: RawStateSnapshot
     events: tuple[BlockRuntimeEventV1, ...]
+    execution_anomalies: tuple[object, ...] = ()
+    execution_stop_reason: str | None = None
+    autonomous_success: bool | None = None

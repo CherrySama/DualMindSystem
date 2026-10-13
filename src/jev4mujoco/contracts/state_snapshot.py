@@ -4,8 +4,12 @@ from dataclasses import dataclass, fields, is_dataclass
 from enum import Enum
 from math import isfinite
 from typing import Any
-from jev4mujoco.contracts.local_intent import LocalIntentContextV1
+from jev4mujoco.contracts.local_intent import LocalIntentContextV1, PlacementCorrectionV1
 from jev4mujoco.contracts.tool_geometry import ToolGeometryV1
+from jev4mujoco.contracts.interaction_evidence import InteractionEvidenceV1
+from jev4mujoco.contracts.press_event import PressEventEvidenceV1
+from jev4mujoco.contracts.grasp_approach import GraspApproachV1
+from jev4mujoco.contracts.released_placement import ReleasedPlacementOutcomeV1
 
 from jev4mujoco.contracts.task_plan import TASK_REGISTRY_VERSION, TaskKind
 from jev4mujoco.contracts.visual_scene import (
@@ -58,6 +62,7 @@ class GraspState(str, Enum):
 class EffectorContactMode(str, Enum):
     UNKNOWN = "unknown"
     CLEAR = "clear"
+    CONTACT_CANDIDATE = "contact_candidate"
     SINGLE_FINGER = "single_finger"
     GRASP_CONTACT = "grasp_contact"
     PUSH_CONTACT = "push_contact"
@@ -252,6 +257,41 @@ class SupportStateV2:
 
 
 @dataclass(frozen=True, slots=True)
+class GraspDiagnosticV1:
+    """Current estimator diagnostics, not proof of physical slipping or dropping."""
+
+    subject_ref: str
+    reason: str
+    based_on_state_id: int
+    based_on_action_epoch: int
+    based_on_observation_id: int
+    timestamp_s: float
+    visual_visibility: str
+    current_relative_robot_base_m: Vec3 | None = None
+    candidate_anchor_relative_robot_base_m: Vec3 | None = None
+    probe_anchor_relative_robot_base_m: Vec3 | None = None
+    relative_drift_robot_base_m: Vec3 | None = None
+    relative_drift_m: float | None = None
+    maximum_relative_drift_m: float | None = None
+
+    def __post_init__(self) -> None:
+        for name in ("subject_ref", "reason", "visual_visibility"):
+            _identifier(getattr(self, name), f"grasp diagnostic {name}")
+        if (self.based_on_state_id <= 0 or self.based_on_action_epoch < 0
+            or self.based_on_observation_id <= 0 or not isfinite(self.timestamp_s)
+            or self.timestamp_s < 0):
+            raise ValueError("invalid grasp diagnostic observation binding")
+        for name in ("current_relative_robot_base_m", "candidate_anchor_relative_robot_base_m",
+            "probe_anchor_relative_robot_base_m", "relative_drift_robot_base_m"):
+            value = getattr(self, name)
+            if value is not None:
+                _finite_vector(value, 3, f"grasp diagnostic {name}")
+        for value in (self.relative_drift_m, self.maximum_relative_drift_m):
+            if value is not None and (not isfinite(value) or value < 0):
+                raise ValueError("grasp diagnostic drift must be nonnegative or unknown")
+
+
+@dataclass(frozen=True, slots=True)
 class PhysicalEvidenceV2:
     robot_feedback_available: bool
     visual_follow_confirmed: bool
@@ -261,6 +301,8 @@ class PhysicalEvidenceV2:
     contact_source: str = "unknown"
     grasp_source: str = "unknown"
     support_source: str = "unknown"
+    grasp_diagnostic: GraspDiagnosticV1 | None = None
+    interaction_estimate: InteractionEvidenceV1 | None = None
 
     def __post_init__(self) -> None:
         for name in ("contact_source", "grasp_source", "support_source"):
@@ -620,12 +662,22 @@ class PhaseFeedbackV1:
     based_on_skill: SkillStateV2 | None = None
     observation_basis: PhaseObservationBasisV1 | None = None
     previous_observation_basis: PhaseObservationBasisV1 | None = None
+    released_placement_outcome: ReleasedPlacementOutcomeV1 | None = None
 
     def __post_init__(self) -> None:
         for name in ("skill_instance_id", "phase", "contract_id", "reason"):
             _identifier(getattr(self, name), f"phase feedback {name}")
         if self.outcome not in ("pending", "passed", "failed"):
             raise ValueError("unknown phase feedback outcome")
+        released = self.released_placement_outcome
+        if released is not None and (
+            (released.skill_instance_id, released.based_on_state_id, released.based_on_action_epoch,
+             released.based_on_observation_id) != (self.skill_instance_id, self.based_on_state_id,
+                self.based_on_action_epoch, self.based_on_observation_id)
+            or self.based_on_skill is None
+            or (released.subject_ref, released.target_ref) !=
+                (self.based_on_skill.subject_ref, self.based_on_skill.target_ref)):
+            raise ValueError("released-placement outcome must match current phase feedback")
         if len({item.name for item in self.measurements}) != len(self.measurements):
             raise ValueError("phase measurement names must be unique")
         if len({item.constraint_id for item in self.maintain_constraints}) != len(self.maintain_constraints):
@@ -674,6 +726,9 @@ class StateSnapshotV2:
     decision_feedback: DecisionFeedbackV1 | None = None
     phase_feedback: PhaseFeedbackV1 | None = None
     local_intent: LocalIntentContextV1 | None = None
+    placement_correction: PlacementCorrectionV1 | None = None
+    press_event: PressEventEvidenceV1 | None = None
+    grasp_approach: GraspApproachV1 | None = None
     schema: str = "StateSnapshotV2"
     schema_version: int = 2
 
@@ -742,6 +797,19 @@ class StateSnapshotV2:
                 or intent.skill_instance_id != self.skill.skill_instance_id
                 or intent.phase != self.skill.phase):
                 raise ValueError("local intent context does not match the current snapshot")
+            if intent.push_contact_plan is not None and not intent.push_contact_plan.matches(self.skill):
+                raise ValueError("push contact plan scope does not match the current skill")
+            if intent.push_preparation is not None and not intent.push_preparation.plan.matches(self.skill):
+                raise ValueError("push preparation scope does not match the current skill")
+        if self.placement_correction is not None:
+            correction = self.placement_correction
+            if (not correction.matches(self.skill) or correction.trigger_state_id > self.state_id
+                or correction.trigger_action_epoch > self.action_epoch
+                or correction.trigger_observation_id > self.visual_scene.observation_id
+                or (correction.resolved_state_id is not None and (
+                    correction.resolved_state_id > self.state_id or correction.resolved_action_epoch > self.action_epoch
+                    or correction.resolved_observation_id > self.visual_scene.observation_id))):
+                raise ValueError("placement correction scope or evidence does not match snapshot")
 
         entity_ids = {entity.track_id for entity in self.visual_scene.entities}
         region_ids = {region.region_id for region in self.visual_scene.regions}

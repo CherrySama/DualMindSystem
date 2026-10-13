@@ -14,9 +14,9 @@ from jev4mujoco.contracts.actions import (
     ActionResult,
     ActionStatus,
     AtomicAction,
-    RawStateSnapshot,
     TRANSLATION_DIRECTIONS_ROBOT_BASE,
 )
+from jev4mujoco.contracts.robot_feedback import RobotFeedbackV1
 
 
 FloatArray = NDArray[np.float64]
@@ -58,7 +58,7 @@ def _rotation_about_x(angle_rad: float) -> FloatArray:
 
 @dataclass(frozen=True, slots=True)
 class _ExecutionMetrics:
-    end: RawStateSnapshot
+    end: RobotFeedbackV1
     physics_steps: int
     commanded_delta_base: FloatArray
     measured_delta_base: FloatArray
@@ -79,7 +79,7 @@ class AtomicActionExecutor:
         self._backend = backend
         self._config = config
         self._execution_lock = Lock()
-        self._last_snapshot = backend.snapshot()
+        self._last_snapshot = backend.robot_feedback()
 
     def execute(self, request: ActionRequest) -> ActionResult:
         if not self._execution_lock.acquire(blocking=False):
@@ -101,7 +101,7 @@ class AtomicActionExecutor:
             self._execution_lock.release()
 
     def _execute_locked(self, request: ActionRequest) -> ActionResult:
-        start = self._backend.snapshot()
+        start = self._backend.robot_feedback()
         self._last_snapshot = start
         commanded_delta, commanded_joint6_delta, commanded_gripper = self._command(
             request.action, start, request.translation_step_m
@@ -127,13 +127,13 @@ class AtomicActionExecutor:
 
         try:
             if request.action in _TRANSLATION_DELTAS:
-                metrics = self._execute_translation(start, commanded_delta)
+                metrics = self._execute_translation(start, commanded_delta, request.held_object_estimate)
             elif request.action in (AtomicAction.ROTATE_CW, AtomicAction.ROTATE_CCW):
                 metrics = self._execute_rotation(start, commanded_joint6_delta)
             else:
                 metrics = self._execute_gripper_or_hold(start, request.action, commanded_gripper)
         except (ValueError, np.linalg.LinAlgError) as error:
-            end = self._backend.snapshot()
+            end = self._backend.robot_feedback()
             physics_steps = int(
                 round(
                     (end.simulation_time_s - start.simulation_time_s)
@@ -142,7 +142,7 @@ class AtomicActionExecutor:
             )
             executed = physics_steps > 0
             if executed:
-                end = self._backend.commit_action()
+                end = self._backend.commit_robot_action()
             self._last_snapshot = end
             return ActionResult(
                 event_type="action_result",
@@ -172,7 +172,7 @@ class AtomicActionExecutor:
                 start_simulation_time_s=start.simulation_time_s,
                 end_simulation_time_s=end.simulation_time_s,
             )
-        end = self._backend.commit_action()
+        end = self._backend.commit_robot_action()
         self._last_snapshot = end
         status = ActionStatus.COMPLETED if metrics.success else ActionStatus.TIMED_OUT
         reason = None if metrics.success else "acceptance_threshold_not_met_before_timeout"
@@ -208,7 +208,7 @@ class AtomicActionExecutor:
         )
 
     def _command(
-        self, action: AtomicAction, start: RawStateSnapshot,
+        self, action: AtomicAction, start: RobotFeedbackV1,
         translation_step_m: float | None = None,
     ) -> tuple[FloatArray, float, float]:
         delta = np.zeros(3, dtype=np.float64)
@@ -259,7 +259,7 @@ class AtomicActionExecutor:
         return update
 
     def _execute_translation(
-        self, start: RawStateSnapshot, commanded_delta_base: FloatArray
+        self, start: RobotFeedbackV1, commanded_delta_base: FloatArray, held_object_estimate=None
     ) -> _ExecutionMetrics:
         start_position_world = np.asarray(start.tcp_position_world_m)
         target_position_world = (
@@ -270,14 +270,9 @@ class AtomicActionExecutor:
         )
         target_rotation_world = self._backend.tcp_rotation_world()
         lower, upper = self._backend.arm_joint_limits
-        holding_object = (
-            np.isclose(start.gripper_target_m, self._config.gripper_closed_joint_m)
-            and start.contacts.left_finger_bowl_contact
-            and start.contacts.right_finger_bowl_contact
-        )
         convergence_fraction = (
             self._config.held_object_convergence_fraction
-            if holding_object
+            if held_object_estimate is True
             else self._config.free_space_convergence_fraction
         )
         position_convergence_m = (
@@ -286,7 +281,7 @@ class AtomicActionExecutor:
         maximum_steps = ceil(self._config.action_timeout_s / self._backend.physics_dt_s)
         steps = 0
         for _ in range(maximum_steps):
-            current = self._backend.snapshot()
+            current = self._backend.robot_feedback()
             measured_delta = np.asarray(current.tcp_position_robot_base_m) - np.asarray(
                 start.tcp_position_robot_base_m
             )
@@ -310,10 +305,10 @@ class AtomicActionExecutor:
             )
             self._backend.set_arm_compensated_position_targets(nominal_target)
             self._backend.set_gripper_position_target(start.gripper_target_m)
-            self._backend.step()
+            self._backend.step_robot()
             steps += 1
 
-        end = self._backend.snapshot()
+        end = self._backend.robot_feedback()
         measured_delta = np.asarray(end.tcp_position_robot_base_m) - np.asarray(
             start.tcp_position_robot_base_m
         )
@@ -348,7 +343,7 @@ class AtomicActionExecutor:
         )
 
     def _execute_rotation(
-        self, start: RawStateSnapshot, commanded_joint6_delta: float
+        self, start: RobotFeedbackV1, commanded_joint6_delta: float
     ) -> _ExecutionMetrics:
         start_position_world = np.asarray(start.tcp_position_world_m)
         start_rotation_world = self._backend.tcp_rotation_world()
@@ -365,7 +360,7 @@ class AtomicActionExecutor:
         maximum_steps = ceil(self._config.action_timeout_s / self._backend.physics_dt_s)
         steps = 0
         for _ in range(maximum_steps):
-            current = self._backend.snapshot()
+            current = self._backend.robot_feedback()
             position_error = start_position_world - np.asarray(current.tcp_position_world_m)
             rotation_error = _rotation_vector(
                 np.einsum(
@@ -395,10 +390,10 @@ class AtomicActionExecutor:
             nominal_target[5] = joint6_target
             self._backend.set_arm_compensated_position_targets(nominal_target)
             self._backend.set_gripper_position_target(start.gripper_target_m)
-            self._backend.step()
+            self._backend.step_robot()
             steps += 1
 
-        end = self._backend.snapshot()
+        end = self._backend.robot_feedback()
         measured_delta_base = np.asarray(end.tcp_position_robot_base_m) - np.asarray(
             start.tcp_position_robot_base_m
         )
@@ -425,7 +420,7 @@ class AtomicActionExecutor:
 
     def _execute_gripper_or_hold(
         self,
-        start: RawStateSnapshot,
+        start: RobotFeedbackV1,
         action: AtomicAction,
         commanded_gripper: float,
     ) -> _ExecutionMetrics:
@@ -440,7 +435,7 @@ class AtomicActionExecutor:
         maximum_steps = ceil(duration / self._backend.physics_dt_s)
         steps = 0
         for _ in range(maximum_steps):
-            current = self._backend.snapshot()
+            current = self._backend.robot_feedback()
             position_error = start_position_world - np.asarray(current.tcp_position_world_m)
             rotation_error = _rotation_vector(
                 np.einsum(
@@ -464,10 +459,10 @@ class AtomicActionExecutor:
             )
             self._backend.set_arm_compensated_position_targets(nominal_target)
             self._backend.set_gripper_position_target(commanded_gripper)
-            self._backend.step()
+            self._backend.step_robot()
             steps += 1
 
-        end = self._backend.snapshot()
+        end = self._backend.robot_feedback()
         measured_delta = np.asarray(end.tcp_position_robot_base_m) - np.asarray(
             start.tcp_position_robot_base_m
         )
@@ -508,7 +503,7 @@ class AtomicActionExecutor:
         )
 
     @staticmethod
-    def _measured_delta(start: RawStateSnapshot, end: RawStateSnapshot) -> tuple[float, float, float]:
+    def _measured_delta(start: RobotFeedbackV1, end: RobotFeedbackV1) -> tuple[float, float, float]:
         delta = np.asarray(end.tcp_position_robot_base_m) - np.asarray(
             start.tcp_position_robot_base_m
         )
@@ -517,7 +512,7 @@ class AtomicActionExecutor:
     def _rejected(
         self,
         request: ActionRequest,
-        state: RawStateSnapshot,
+        state: RobotFeedbackV1,
         commanded_delta: FloatArray,
         commanded_joint6_delta: float,
         commanded_gripper: float,

@@ -31,9 +31,13 @@ def grasp_height_band_v1(
 
 def grasp_translation_step_v1(
     snapshot: StateSnapshotV2, subject_ref: str, action: AtomicAction,
-    maximum_step_m: float,
+    maximum_step_m: float, preparation_target=None,
 ) -> float:
     """Bound a grasp-alignment step by the visual error on its action axis."""
+    from jev4mujoco.runtime.grasp_observation import grasp_approach_translation_step_v1
+    preparation_step=grasp_approach_translation_step_v1(snapshot,action,maximum_step_m,preparation_target)
+    if preparation_step is not None:
+        return preparation_step
     band = grasp_height_band_v1(snapshot, subject_ref)
     if band is None:
         return maximum_step_m

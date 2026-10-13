@@ -6,11 +6,23 @@ from math import isfinite, sqrt
 from typing import Any
 from jev4mujoco.contracts.actions import AtomicAction, TRANSLATION_DIRECTIONS_ROBOT_BASE
 
-from jev4mujoco.runtime.progress import pick_xy_error_v1
-from jev4mujoco.runtime.grasp_geometry import grasp_pose_correction_v1
-from jev4mujoco.runtime.local_intent import local_intent_correction_v1, local_intent_metric_v1
-from jev4mujoco.runtime.tool_geometry import contact_geometry_v1, observed_contact_sides_v1
-from jev4mujoco.contracts.state_snapshot import StateSnapshotV2
+from jev4mujoco.runtime.progress import pick_xy_error_v1, placement_horizontal_measurements_v1
+from jev4mujoco.runtime.grasp_geometry import grasp_pose_correction_v1, grasp_translation_step_v1
+from jev4mujoco.runtime.grasp_observation import grasp_approach_context_v1
+from jev4mujoco.runtime.placement_preparation import placement_preparation_context_v1
+from jev4mujoco.runtime.local_intent import (local_intent_correction_v1, local_intent_metric_v1,
+    local_intent_conditions_v1, placement_relation_restore_mode_v1, current_runtime_measurements_v1,
+    apply_placement_action_permissions_v1, placement_height_interval_v1,
+    tool_retraction_motion_ready_v1,
+    task_observation_motion_ready_v1,
+    local_intent_interval_value_v1, local_intent_interval_distance_v1)
+from jev4mujoco.runtime.tool_geometry import (contact_geometry_v1, observed_contact_sides_v1,
+    tool_transfer_clearance_v1)
+from jev4mujoco.runtime.push_interaction import (
+    push_interaction_mode_v1, current_push_plan_side_v1, push_goal_geometry_v1)
+from jev4mujoco.runtime.observation_geometry import (
+    required_task_observation_refs_v1, current_visibility_diagnostic_v1)
+from jev4mujoco.contracts.state_snapshot import GraspState, StateSnapshotV2
 from jev4mujoco.planning.phase_definitions import (
     bound_subtask_definition_v1, GOAL_DEFINITIONS_V1, PHASE_MEASUREMENT_DEFINITIONS_V1,
 )
@@ -201,6 +213,14 @@ def _motion_error(snapshot, subject, target):
         role = "subject_bottom_to_required_clearance"
         deficit = measurements.get("subject_bottom_clearance_deficit_m")
         delta = None if deficit is None else [0.0, 0.0, deficit]
+    elif kind == "place" and phase == "retract_after_release":
+        role = "finger_tool_to_transfer_clearance"
+        deficit = current_runtime_measurements_v1(snapshot).get("tool_transfer_clearance_deficit_m")
+        delta = None if deficit is None or not tool_retraction_motion_ready_v1(snapshot) else [0.0, 0.0, deficit]
+    elif kind == "place" and phase == "observe_task_geometry":
+        role = "task_geometry_observability"
+        # 可见跨度缺口不等于沿Z移动的距离，不能输出一个伪造的TCP目标。
+        delta = None
     return role, delta, tolerance
 
 
@@ -237,6 +257,8 @@ def _contact_context(snapshot, side, actions, step_m):
     geometry = contact_geometry_v1(snapshot, side)
     current = geometry["local_error_m"]
     evaluations = []
+    values = current_runtime_measurements_v1(snapshot)
+    height_delta, height_tolerance = values.get("tcp_to_push_height_z_m"), values.get("push_height_tolerance_m")
     for action in actions:
         direction = ((0.0, 0.0, 0.0) if action == "hold" else
             TRANSLATION_DIRECTIONS_ROBOT_BASE.get(AtomicAction(action)))
@@ -245,12 +267,317 @@ def _contact_context(snapshot, side, actions, step_m):
         delta = tuple(step_m * value for value in direction)
         predicted = contact_geometry_v1(snapshot, side, delta)
         projected = predicted["local_error_m"]
+        height_deficit = (None if height_delta is None or height_tolerance is None else
+            max(0.0, abs(height_delta - delta[2]) - height_tolerance))
         evaluations.append({"action": action, "expected_tcp_delta_robot_base_m": delta,
+            "projected_original_height_deficit_m": height_deficit,
+            "inward_normal_command_m": float(-sum(delta[i] * side.outward_normal_xy[i] for i in (0, 1))),
+            "tangential_command_m": float(delta[0] * -side.outward_normal_xy[1] + delta[1] * side.outward_normal_xy[0]),
             "projected_local_error_m": projected,
             "projected_progress_m": None if current is None or projected is None else current - projected,
             "projected_contact_summary": _contact_prediction_summary(predicted), "source": "bounded_command_geometry",
             "is_observed": False, "assumptions": "fixed subject and tool orientation; ignores dynamics and path collisions"})
     return {"geometry": geometry, "action_evaluations": evaluations}
+
+
+def _native_push_goal_change(before, after):
+    """同一关系自身的反事实变化量；不排序、不合成评分、不预测物理跟随。"""
+    if before.get("status") != "observed" or after.get("status") not in ("observed", "counterfactual"):
+        return None
+    if "vertex_outside_distances_m" in before and "vertex_outside_distances_m" in after:
+        return {"maximum_outside_distance_reduction_m":
+            max(before["vertex_outside_distances_m"]) - max(after["vertex_outside_distances_m"]),
+            "sign_meaning": "positive reduces outside distance; negative increases it"}
+    if "footprint_clearance_m" in before and "footprint_clearance_m" in after:
+        return {"clearance_increase_m": after["footprint_clearance_m"] - before["footprint_clearance_m"],
+            "minimum_signed_vertex_distance_increase_m": min(after["vertex_signed_boundary_distances_m"])
+                - min(before["vertex_signed_boundary_distances_m"]),
+            "overlap_before_after": (before["footprints_overlap"], after["footprints_overlap"]),
+            "directional_exit_remaining_reductions_m": tuple({"direction_xy": item["direction_xy"],
+                "reduction_m": old["remaining_translation_m"] - item["remaining_translation_m"]}
+                for item in after.get("directional_exit_requirements", ())
+                for old in before.get("directional_exit_requirements", ())
+                if item["direction_xy"] == old["direction_xy"]),
+            "sign_meaning": "positive clearance/vertex increase enlarges that distance; positive directional reduction decreases the remaining exit requirement. Clearance stays zero while overlapping; vertex distance alone does not certify clear_of_region"}
+    return None
+
+
+def _push_goal_counterfactual(snapshot, delta):
+    geometry = push_goal_geometry_v1(snapshot, delta_xy=delta)
+    if geometry["status"] != "observed":
+        return geometry
+    result = {k: v for k, v in geometry.items() if k not in ("exit_region_ref", "exit_region_boundary_xy_m")}
+    result["status"] = "counterfactual"
+    if "directional_exit_requirements" in geometry:
+        # 完整终点只在当前各侧面计划中出现一次，原子小步保留未排序的变化量。
+        result["directional_exit_requirements"] = tuple({k: item[k] for k in (
+            "edge_index", "direction_xy", "remaining_translation_m")}
+            for item in geometry["directional_exit_requirements"])
+    return result
+
+
+def _push_goal_context(snapshot, actions, step_m):
+    current = push_goal_geometry_v1(snapshot)
+    observed = None
+    feedback = snapshot.phase_feedback
+    basis = None if feedback is None else feedback.previous_observation_basis
+    action = snapshot.recent_action
+    if (current["status"] == "observed" and basis is not None and basis.same_scope_as(snapshot.skill)
+        and action is not None and basis.action_epoch == action.start_action_epoch
+        and snapshot.action_epoch == action.end_action_epoch):
+        old = {m.name: m.value for m in feedback.previous_measurements
+            if dict(basis.measurement_evidence_current).get(m.name) is True}
+        previous = {name: old["push_" + name] for name in current if "push_" + name in old}
+        if previous:
+            observed = {"previous_geometry": previous, "source": "fresh_before_after_rgbd_geometry"}
+            if "vertex_outside_distances_m" in previous:
+                observed["maximum_outside_distance_reduction_m"] = max(previous["vertex_outside_distances_m"]) - max(current["vertex_outside_distances_m"])
+            if "footprint_clearance_m" in previous:
+                observed["clearance_increase_m"] = current["footprint_clearance_m"] - previous["footprint_clearance_m"]
+                observed["overlap_before_after"] = (previous.get("footprints_overlap"), current.get("footprints_overlap"))
+    evaluations = []
+    if current["status"] == "observed":
+        for action in actions:
+            direction = ((0.0, 0.0, 0.0) if action == "hold" else
+                TRANSLATION_DIRECTIONS_ROBOT_BASE.get(AtomicAction(action)))
+            if direction is None:
+                continue
+            delta = tuple(step_m * value for value in direction)
+            counterfactual = _push_goal_counterfactual(snapshot, delta[:2])
+            evaluations.append({"action": action, "assumed_subject_delta_xy_m": delta[:2],
+                "translated_footprint_counterfactual": counterfactual,
+                "native_goal_change": _native_push_goal_change(current, counterfactual),
+                "source": "public_footprint_translation_counterfactual", "is_observed": False,
+                "is_physical_push_prediction": False})
+    goal_execution = None if snapshot.local_intent is None else snapshot.local_intent.push_goal_execution
+    selected_exit = None
+    if goal_execution is not None:
+        direction = tuple(-v for v in goal_execution.plan.selected_side.outward_normal_xy)
+        plane = next((p for p in (goal_execution.current_goal.exit_progress
+            if goal_execution.current_goal is not None else ()) if p.direction_xy == direction), None)
+        best = None if plane is None else next((p for p in goal_execution.best_exit_progress if p.same_plane(plane)), None)
+        selected_exit = {"status": "observed" if plane is not None and best is not None else "unknown",
+            "current_observation": None if plane is None else asdict(plane),
+            "best_observation": None if best is None else asdict(best),
+            "actions_without_goal_progress": goal_execution.actions_without_goal_progress,
+            "note": "Best is historical evidence for this same direction/region, not current contact or permission. It persists across explicit plan replacements."}
+    return {"current": current, "action_evaluations": evaluations, "selected_exit_progress": selected_exit,
+        "observed_progress": observed, "continuous_progress_policy_status": (
+            "native_goal_plan_progress" if snapshot.local_intent is not None
+            and snapshot.local_intent.push_goal_execution is not None else "no_selected_goal_plan"),
+        "physical_push_prediction_status": "unsupported",
+        "note": "Counterfactual assumes the subject footprint translates by the stated XY displacement, not that the object follows TCP. Separate from fixed-subject tool predictions. No force/friction/slip or selected-face contact verification is available; actual outcome uses next fresh observation and original Runtime conditions."}
+
+
+def _transport_progress_context(snapshot, actions, step_m):
+    feedback = snapshot.phase_feedback
+    basis = None if feedback is None else feedback.evidence_basis
+    current = placement_horizontal_measurements_v1(snapshot,
+        {} if feedback is None else dict(feedback.parameters),
+        evidence_current=basis is not None and basis.visual_evidence_current)
+    observable = bool(current) and all(item.value is not None for item in current)
+    holding_current = feedback is not None and any(condition.measurement == "subject_held"
+        and condition.observed is True and condition.evidence_current for condition in feedback.conditions)
+    if placement_relation_restore_mode_v1(snapshot) in ("restore_relation", "placement"):
+        holding_current = current_runtime_measurements_v1(snapshot).get("subject_held") is True
+    prediction_available = (observable and holding_current and basis.robot_evidence_current
+        and snapshot.physical.grasp_state is GraspState.HELD
+        and snapshot.physical.held_object_ref == snapshot.skill.subject_ref)
+    evaluations = []
+    if prediction_available:
+        for action in actions:
+            direction = ((0.0, 0.0, 0.0) if action == "hold" else
+                TRANSLATION_DIRECTIONS_ROBOT_BASE.get(AtomicAction(action)))
+            if direction is None or direction[2] != 0.0:
+                continue
+            delta = tuple(step_m * value for value in direction)
+            projected = placement_horizontal_measurements_v1(snapshot, dict(feedback.parameters),
+                evidence_current=True, delta_xy=delta[:2], predicted=True)
+            reductions = []
+            margin_changes = []
+            approach = {}
+            for before, after in zip(current, projected):
+                if before.name in ("placement_containment_margin_m", "placement_overlap_fraction_margin"):
+                    margin_changes.append({"measurement": before.name, "value": after.value - before.value, "unit": before.unit})
+                if before.name == "placement_support_approach_clearance_m":
+                    approach["projected_support_approach_clearance_reduction_m"] = before.value - after.value
+                if "deficit" not in before.name and before.name != "placement_vertex_outside_distances_m":
+                    continue
+                reduction = (tuple(a - b for a, b in zip(before.value, after.value))
+                    if isinstance(before.value, tuple) else before.value - after.value)
+                reductions.append({"measurement": before.name, "value": reduction, "unit": before.unit})
+            evaluations.append({"action": action, "expected_tcp_delta_robot_base_m": delta,
+                "projected_relation_measurements": [asdict(item) for item in projected],
+                "projected_deficit_reductions": reductions,
+                "projected_margin_changes": margin_changes,
+                **approach,
+                "source": "bounded_command_geometry", "is_observed": False,
+                "assumptions": "subject follows TCP rigidly; fixed subject orientation and reference; ignores slip, dynamics and path collisions"})
+    return {"status": "observed" if observable else "unknown" if current else "unsupported",
+        "measurements": [asdict(item) for item in current],
+        "prediction_available": bool(prediction_available), "action_evaluations": evaluations}
+
+
+def _tool_transfer_progress_context(snapshot, actions, step_m):
+    values = current_runtime_measurements_v1(snapshot)
+    clearance, required = values.get("tool_transfer_clearance_m"), values.get("tool_transfer_required_clearance_m")
+    ready = tool_retraction_motion_ready_v1(snapshot)
+    error = values.get("tool_transfer_clearance_deficit_m") if ready else None
+    evaluations = []
+    if ready:
+        for action in actions:
+            if action not in ("up", "hold"):
+                continue
+            dz = step_m if action == "up" else 0.0
+            after = max(0.0, required - clearance - dz)
+            evaluations.append({"action": action, "expected_tcp_delta_robot_base_m": (0.0, 0.0, dz),
+                "projected_tool_transfer_clearance_m": clearance + dz,
+                "projected_local_error_m": after, "projected_progress_m": error - after,
+                "source": "bounded_command_geometry", "is_observed": False,
+                "assumptions": "fixed current finger opening and tool orientation; fixed public reference tops; ignores dynamics and path collisions"})
+    previous_error = None
+    geometry = tool_transfer_clearance_v1(snapshot) if clearance is not None else None
+    feedback = snapshot.phase_feedback
+    basis = None if feedback is None else feedback.previous_observation_basis
+    action = snapshot.recent_action
+    if ready and basis is not None and basis.same_scope_as(snapshot.skill) and action is not None:
+        validity = dict(basis.measurement_evidence_current)
+        old = {m.name: m.value for m in feedback.previous_measurements}
+        names = ("grasp_not_held", "gripper_open_observed", "subject_supported", "capability_goal_satisfied")
+        if (basis.action_epoch == action.start_action_epoch and snapshot.action_epoch == action.end_action_epoch
+            and all(validity.get(name) and old.get(name) is True for name in names)
+            and validity.get("tool_transfer_clearance_deficit_m")):
+            previous_error = old.get("tool_transfer_clearance_deficit_m")
+    return {"status": "observed" if clearance is not None else "unknown",
+        "part_minimum_z_m": None if geometry is None else
+            [{"part_id": ref, "minimum_z_m": z} for ref, z in geometry.part_minimum_z_m],
+        "reference_top_z_m": None if geometry is None else
+            [{"reference_ref": ref, "top_z_m": z} for ref, z in geometry.reference_top_z_m],
+        "clearance_m": clearance, "required_clearance_m": required, "error_m": error,
+        "motion_evidence_ready": ready, "previous_error_m": previous_error,
+        "observed_progress_m": None if previous_error is None else previous_error - error,
+        "prediction_available": ready, "action_evaluations": evaluations,
+        "note": "Finger-tool transfer clearance is separate from release and final stability. It does not certify full-arm avoidance, contact separation or the entire path."}
+
+
+def _task_observation_context(snapshot, actions, step_m):
+    values = current_runtime_measurements_v1(snapshot)
+    error = values.get("task_observation_span_deficit_m")
+    refs = required_task_observation_refs_v1(snapshot)
+    entities = {e.track_id: e for e in snapshot.visual_scene.entities}
+    observations = []
+    for ref in refs:
+        entity = entities.get(ref)
+        diagnostic = None if entity is None else current_visibility_diagnostic_v1(entity, snapshot.visual_scene)
+        observations.append({"entity_ref": ref, "visibility": None if entity is None else entity.visibility.value,
+            "current_fragment_diagnostic": None if diagnostic is None else asdict(diagnostic)})
+    previous_error = None
+    feedback = snapshot.phase_feedback
+    basis = None if feedback is None else feedback.previous_observation_basis
+    action = snapshot.recent_action
+    if error is not None and basis is not None and basis.same_scope_as(snapshot.skill) and action is not None:
+        validity = dict(basis.measurement_evidence_current)
+        old = {m.name: m.value for m in feedback.previous_measurements}
+        clearance, required = old.get("tool_transfer_clearance_m"), old.get("tool_transfer_required_clearance_m")
+        names = ("grasp_not_held", "gripper_open_observed", "subject_supported", "capability_goal_satisfied")
+        if (basis.action_epoch == action.start_action_epoch and snapshot.action_epoch == action.end_action_epoch
+            and all(validity.get(name) and old.get(name) is True for name in names)
+            and validity.get("tool_transfer_clearance_m") and validity.get("tool_transfer_required_clearance_m")
+            and clearance is not None and required is not None and clearance >= required
+            and validity.get("task_observation_span_deficit_m")):
+            previous_error = old.get("task_observation_span_deficit_m")
+    return {"required_entity_refs": refs, "current_observations": observations,
+        "geometry_observed": values.get("required_task_geometry_observed"), "error_m": error,
+        "robot_occlusion_hint": values.get("task_observation_robot_occlusion_hint"),
+        "motion_evidence_ready": task_observation_motion_ready_v1(snapshot),
+        "previous_error_m": previous_error,
+        "observed_progress_m": None if previous_error is None else previous_error - error,
+        "prediction_available": False,
+        "action_evaluations": [{"action": action, "expected_tcp_delta_robot_base_m": (0.0, 0.0, step_m if action == "up" else 0.0),
+            "projected_local_error_m": None, "projected_progress_m": None,
+            "source": "bounded_command_geometry", "is_observed": False,
+            "assumptions": "Only TCP command displacement is known; future visible points and span recovery are unknown."}
+            for action in actions if action in ("up", "hold")],
+        "note": "Current fragment bounds are not whole-object geometry. Reference span and completed identities are historical. Robot adjacency is a sensing clue, not causal occlusion or path safety. Completion only permits original final stability verification."}
+
+
+def _placement_height_progress_context(snapshot, actions, step_m, *, prefix="placement_height_adjustment"):
+    maximum_name, deficit_name = prefix + "_maximum_clearance_m", prefix + "_deficit_m"
+    interval = placement_height_interval_v1(snapshot, maximum_measurement=maximum_name)
+    value = None if interval is None else local_intent_interval_value_v1(interval, snapshot)
+    mode = placement_relation_restore_mode_v1(snapshot)
+    error = None if value is None else local_intent_interval_distance_v1(interval, value)
+    evaluations = []
+    if error is not None:
+        for action in actions:
+            direction = ((0.0, 0.0, 0.0) if action == "hold" else
+                TRANSLATION_DIRECTIONS_ROBOT_BASE.get(AtomicAction(action)))
+            if direction is None:
+                continue
+            delta = tuple(step_m * component for component in direction)
+            projected = value + delta[2]
+            projected_error = local_intent_interval_distance_v1(interval, projected)
+            evaluations.append({"action": action, "expected_tcp_delta_robot_base_m": delta,
+                "projected_subject_bottom_to_target_support_clearance_m": projected,
+                "projected_local_error_m": projected_error, "projected_progress_m": error - projected_error,
+                "source": "bounded_command_geometry", "is_observed": False,
+                "assumptions": "subject follows TCP along Z; fixed target support height; ignores slip, dynamics, rotation and path collisions"})
+    # 只比较同一阶段、动作前后均有效且仍处于持有/对齐作用域的原生测量。
+    feedback = snapshot.phase_feedback
+    previous_error = None
+    basis = None if feedback is None else feedback.previous_observation_basis
+    if error is not None and basis is not None and basis.same_scope_as(snapshot.skill):
+        validity = dict(basis.measurement_evidence_current)
+        old = {m.name: m for m in feedback.previous_measurements}
+        names = ("subject_held", "placement_horizontal_relation_satisfied",
+            deficit_name, maximum_name)
+        action = snapshot.recent_action
+        if (all(validity.get(name) is True and name in old for name in names)
+            and old["subject_held"].value is True and old["placement_horizontal_relation_satisfied"].value is True
+            and old[deficit_name].unit == "m"
+            and old[deficit_name].source == "rgbd_geometry"
+            and old[maximum_name].value == interval.maximum_m
+            and action is not None and feedback.previous_action_epoch == action.start_action_epoch
+            and snapshot.action_epoch == action.end_action_epoch):
+            previous_error = old[deficit_name].value
+    return {"status": "observed" if error is not None else "unknown" if mode in ("unknown", "placement") else "not_applicable",
+        "scope": prefix + "_while_currently_held_and_horizontally_aligned",
+        "interval": None if interval is None else asdict(interval), "clearance_m": value, "error_m": error,
+        "local_condition_satisfied": None if error is None else error == 0.0,
+        "previous_error_m": previous_error,
+        "observed_progress_m": None if previous_error is None else previous_error - error,
+        "prediction_available": error is not None, "action_evaluations": evaluations,
+        "note": "Local height completion is separate from gripper opening and final placement. The interval never vetoes opening; commands predict geometry, not measured effects or safe paths."}
+
+
+def build_local_intent_selection_context_v1(full_context):
+    """侧面选择需要当前几何和全部目标对照；原子动作预测留给动作层。"""
+    payload = copy.deepcopy(full_context)
+    if "push_contact_geometry" in payload:
+        payload["push_contact_geometry"] = [{"geometry": item["geometry"]}
+            for item in payload["push_contact_geometry"]]
+        payload["push_prediction_scope"] = "Intent selection sees all current sides and goal counterfactuals; per-action tool predictions are provided after selecting the local objective."
+        if "push_goal_progress" in payload:
+            payload["push_goal_progress"]["action_evaluations"] = []
+    return payload
+
+
+def _scope_push_goal_to_side(progress, side):
+    """动作层聚焦已经选择的方向，不改变完整状态或意图层候选。"""
+    result = copy.deepcopy(progress)
+    direction = tuple(-v for v in side.outward_normal_xy)
+    for geometry in [result["current"], *(item["translated_footprint_counterfactual"]
+        for item in result.get("action_evaluations", ()) )]:
+        if "directional_exit_requirements" in geometry:
+            geometry["directional_exit_requirements"] = tuple(item for item in geometry["directional_exit_requirements"]
+                if tuple(item["direction_xy"]) == direction)
+    for item in result.get("action_evaluations", ()):
+        change = item.get("native_goal_change")
+        if change is not None and "directional_exit_remaining_reductions_m" in change:
+            change["directional_exit_remaining_reductions_m"] = tuple(p for p in change["directional_exit_remaining_reductions_m"]
+                if tuple(p["direction_xy"]) == direction)
+    result["direction_scope"] = "selected_side_only; all side plans remain available on intent selection/replanning"
+    return result
 
 
 def build_local_intent_motor_context_v1(snapshot, candidate, full_context):
@@ -269,6 +596,17 @@ def build_local_intent_motor_context_v1(snapshot, candidate, full_context):
         "maintain": candidate.maintain, "path_verified": candidate.path_verified,
         "contact_side": None if candidate.contact_side is None else asdict(candidate.contact_side),
     }
+    preparing = candidate.choice_id.startswith(("prepare_push_side_edge_", "align_reprepared_push_edge_"))
+    if preparing:
+        selected["phase_requirement_roles"] = {
+            "supported_push_contact": "restore_after_preparation; actual contact must be clear during reposition/alignment",
+            "tcp_to_push_height_z_m": "restore_after_preparation; original contact height is not this local action target",
+            "capability_goal_satisfied": "final_phase_verification; not this preparation step completion"}
+    if candidate.completion_conditions:
+        selected["completion_conditions"] = [{**asdict(condition), "satisfied": condition.satisfied}
+            for condition in local_intent_conditions_v1(candidate, snapshot)]
+    if candidate.progress_interval is not None:
+        selected["progress_interval"] = asdict(candidate.progress_interval)
     evaluations = []
     if correction is not None and candidate.metric_kind in ("tcp_xy", "tcp_z"):
         # Predicted command geometry, not a physical/contact model or an action selector.
@@ -279,20 +617,67 @@ def build_local_intent_motor_context_v1(snapshot, candidate, full_context):
             if direction is None:
                 continue
             step = steps.get(action, full_context["handle"]["translation_step_m"])
+            if candidate.choice_id.startswith("prepare_grasp_view_"):
+                step = grasp_translation_step_v1(snapshot, snapshot.skill.subject_ref, AtomicAction(action),
+                    full_context["handle"]["translation_step_m"], candidate.target_robot_base_m)
             delta = tuple(step * value for value in direction)
             axes = (0, 1) if candidate.metric_kind == "tcp_xy" else (2,)
             projected = sqrt(sum((correction[i] - delta[i]) ** 2 for i in axes))
             evaluations.append({"action": action, "expected_tcp_delta_robot_base_m": delta,
                 "projected_local_error_m": projected, "projected_progress_m": current - projected,
                 "source": "bounded_command_geometry", "is_observed": False})
+    if candidate.choice_id == "observe_grasp_geometry":
+        for action in candidate.allowed_actions:
+            step = grasp_translation_step_v1(snapshot, snapshot.skill.subject_ref, AtomicAction(action),
+                full_context["handle"]["translation_step_m"])
+            evaluations.append({"action": action, "expected_tcp_delta_robot_base_m": (0.,0.,step if action == "up" else 0.),
+                "projected_visibility": None, "projected_local_error_m": None, "projected_progress_m": None,
+                "source": "bounded_robot_retraction_geometry", "is_observed": False,
+                "note": "Visibility improvement and complete geometry require the next fresh RGB-D observation."})
     contact_context = None
-    if candidate.metric_kind == "contact_geometry":
+    if candidate.contact_side is not None and snapshot.skill.skill_kind == "surface_push":
         contact_context = next((item for item in full_context.get("push_contact_geometry", ())
             if item["geometry"].get("side", {}).get("edge_index") == candidate.contact_side.edge_index), None)
         if contact_context is None:
             contact_context = _contact_context(snapshot, candidate.contact_side, candidate.allowed_actions,
                 full_context["handle"]["translation_step_m"])
-        evaluations = contact_context["action_evaluations"]
+        # 点准备以当前目标点为度量，不能被接触距离覆盖。
+        if candidate.metric_kind not in ("tcp_xy", "tcp_z") and not candidate.choice_id.startswith("prepare_push_side_edge_"):
+            evaluations = [item for item in contact_context["action_evaluations"] if item["action"] in candidate.allowed_actions]
+    if candidate.choice_id.startswith("prepare_push_side_edge_"):
+        values = current_runtime_measurements_v1(snapshot)
+        height = values.get("tcp_to_push_reposition_height_z_m")
+        clearance, tolerance = values.get("push_tool_above_subject_clearance_m"), values.get("push_height_tolerance_m")
+        current = local_intent_metric_v1(candidate, snapshot)
+        if height is not None and clearance is not None and tolerance is not None and current is not None:
+            for action in candidate.allowed_actions:
+                step = full_context["handle"]["translation_step_m"]
+                delta = step if action == "up" else -step if action == "down" else 0.0
+                height_deficit = max(0.0, abs(height - delta) - tolerance)
+                projected = max(height_deficit, -clearance - delta, 0.0)
+                evaluations.append({"action": action, "expected_tcp_delta_robot_base_m": (0.0, 0.0, delta),
+                    "projected_reposition_height_deficit_m": height_deficit,
+                    "projected_tool_above_subject_clearance_m": clearance + delta,
+                    "projected_local_error_m": projected, "projected_progress_m": current - projected,
+                    "is_observed": False, "source": "bounded_command_geometry",
+                    "note": "Fixed subject and tool orientation; actual contact clear still requires fresh feedback."})
+    if ((snapshot.skill.skill_kind == "transport" and snapshot.skill.phase == "align_target_xy"
+        and candidate.choice_id == "align_target_xy") or candidate.choice_id == "restore_placement_relation"):
+        evaluations = [item for item in full_context.get("transport_goal_progress", {}).get("action_evaluations", ())
+            if item["action"] in candidate.allowed_actions]
+    if candidate.choice_id == "retract_after_release":
+        evaluations = [item for item in full_context.get("tool_transfer_clearance", {}).get("action_evaluations", ())
+            if item["action"] in candidate.allowed_actions]
+    if candidate.choice_id == "observe_task_geometry":
+        evaluations = [item for item in full_context.get("goal_observation", {}).get("action_evaluations", ())
+            if item["action"] in candidate.allowed_actions]
+    if candidate.progress_interval is not None:
+        height_key = ("placement_support_approach" if candidate.choice_id == "approach_placement_support"
+            else "placement_height_adjustment")
+        horizontal = {item["action"]: item for item in full_context.get("transport_goal_progress", {}).get("action_evaluations", ())}
+        evaluations = [{**horizontal.get(item["action"], {}), **item}
+            for item in full_context.get(height_key, {}).get("action_evaluations", ())
+            if item["action"] in candidate.allowed_actions]
     phase = full_context["phase"]
     # 点意图也必须看到阶段条件；局部距离不替代完整阶段或持续约束。
     phase_state = copy.deepcopy(phase)
@@ -301,7 +686,7 @@ def build_local_intent_motor_context_v1(snapshot, candidate, full_context):
     names.update(item["condition"]["measurement"] for item in phase["maintain_constraints"]
                  if item["condition"] is not None)
     needs_goal = ("capability_goal_satisfied" in names or "placement_horizontal_relation_satisfied" in names
-        or snapshot.skill.skill_kind == "place")
+        or snapshot.skill.skill_kind in ("place", "surface_push"))
     if needs_goal:
         phase_state["bound_relation"] = full_context["subtask_definition"]["final_goal"]
     else:
@@ -315,7 +700,7 @@ def build_local_intent_motor_context_v1(snapshot, candidate, full_context):
                 basis["measurement_evidence_current"] = {name: valid
                     for name, valid in basis["measurement_evidence_current"].items() if name not in omitted}
     intent = full_context["local_intent"]
-    return {
+    payload = {
         "schema": "JEVLocalActionContextV1", "schema_version": 1,
         "state_id": snapshot.state_id, "action_epoch": snapshot.action_epoch,
         "timestamp_s": snapshot.timestamp_s, "selected_local_intent": selected,
@@ -325,6 +710,9 @@ def build_local_intent_motor_context_v1(snapshot, candidate, full_context):
         "local_intent": None if intent is None else {
             "execution": intent["execution"], "retained_approach": intent["retained_approach"],
             "handoff": intent["handoff"], "last_termination": intent["last_termination"],
+            "push_contact_plan": intent["push_contact_plan"],
+            "push_preparation": intent["push_preparation"],
+            "push_goal_execution": intent["push_goal_execution"],
             "replan_count": intent["replan_count"], "blocked_reason": intent["blocked_reason"]},
         "robot": full_context["robot"], "physical": full_context["physical"],
         "subject": full_context["subject"], "dependencies": full_context["dependencies"],
@@ -335,6 +723,69 @@ def build_local_intent_motor_context_v1(snapshot, candidate, full_context):
         "handle": {**full_context["handle"], "available_actions": list(candidate.allowed_actions)},
         "release_geometry": full_context["interaction"]["release_geometry"],
     }
+    if snapshot.press_event is not None:
+        payload["press_event"] = asdict(snapshot.press_event)
+    if snapshot.grasp_approach is not None:
+        payload["grasp_approach"] = grasp_approach_context_v1(snapshot,include_options=False)
+    if candidate.placement_preparation is not None:
+        payload["placement_preparation"] = placement_preparation_context_v1(candidate,snapshot)
+    if contact_context is not None and not preparing:
+        payload["contact_action_evaluations"] = [item for item in contact_context["action_evaluations"] if item["action"] in candidate.allowed_actions]
+        # 靠近工具不等于交互成立：显式区分几何修正与动作后响应采集。
+        estimate = snapshot.physical.evidence.interaction_estimate
+        values = current_runtime_measurements_v1(snapshot)
+        current_estimate = (estimate is not None and
+            (estimate.state_id, estimate.action_epoch, estimate.observation_id, estimate.subject_ref)
+            == (snapshot.state_id, snapshot.action_epoch, snapshot.visual_scene.observation_id, snapshot.skill.subject_ref))
+        acquisition = (current_estimate and estimate.status == "candidate"
+            and all(values.get(name) is True for name in (
+                "subject_supported", "grasp_not_held", "push_tool_closed_observed", "push_height_ready")))
+        payload["contact_response_objective"] = {
+            "motion_response_acquisition_needed": acquisition,
+            "estimate_status": estimate.status if current_estimate else "unknown",
+            "source": "current_rgbd_robot_interaction_estimate",
+            "note": "When acquisition is needed, zero fixed-subject geometry error is not the action objective: compare permitted inward/tangential components and native goal counterfactuals, then inspect actual tool/object response. No direction is preselected and no contact/force is certified by a command."}
+        if candidate.metric_kind in ("contact_geometry", "runtime_conditions"):
+            # 同一预测的完整有限面诊断保留一次，避免重复放大模型输入。
+            payload["action_evaluations"] = [{k: v for k, v in item.items()
+                if k != "projected_contact_summary"} for item in evaluations]
+    if "transport_goal_progress" in full_context:
+        payload["transport_goal_progress"] = {key: value
+            for key, value in full_context["transport_goal_progress"].items() if key != "action_evaluations"}
+    if "push_goal_progress" in full_context:
+        payload["push_goal_progress"] = ({**full_context["push_goal_progress"], "action_evaluations": [],
+            "action_prediction_scope": "Final relation is deferred during selected preparation; use this local step's action_evaluations. All side-goal counterfactuals remain available for plan comparison."}
+            if preparing else full_context["push_goal_progress"])
+        clear_exit = full_context["push_goal_progress"]["current"].get("predicate") == "clear_of_region"
+        if candidate.contact_side is not None and clear_exit:
+            payload["push_goal_progress"] = _scope_push_goal_to_side(payload["push_goal_progress"], candidate.contact_side)
+        payload["push_interaction"] = full_context["push_interaction"]
+        payload["push_side_goal_counterfactuals"] = [{"side": item["side"],
+            "exit_plan_geometry": item.get("exit_plan_geometry"),
+            "native_goal_change": {key: value for key, value in (item.get("native_goal_change") or {}).items()
+                if key != "directional_exit_remaining_reductions_m"},
+            "is_observed": False, "is_physical_push_prediction": False}
+            for item in full_context["push_side_goal_counterfactuals"]] if clear_exit else full_context["push_side_goal_counterfactuals"]
+        if contact_context is None:
+            # 没有选接触侧面的高度/推进目标仍看到全部当前几何，
+            # 不重复携带每个未选侧面的原子动作预测。
+            payload["push_contact_geometry"] = [{"geometry": item["geometry"]}
+                for item in full_context["push_contact_geometry"]]
+    if "placement_relation_restore" in full_context:
+        payload["placement_relation_restore"] = full_context["placement_relation_restore"]
+    if "placement_height_adjustment" in full_context:
+        payload["placement_height_adjustment"] = {key: value
+            for key, value in full_context["placement_height_adjustment"].items() if key != "action_evaluations"}
+    if "placement_support_approach" in full_context:
+        payload["placement_support_approach"] = {key: value
+            for key, value in full_context["placement_support_approach"].items() if key != "action_evaluations"}
+    if "tool_transfer_clearance" in full_context:
+        payload["tool_transfer_clearance"] = {key: value
+            for key, value in full_context["tool_transfer_clearance"].items() if key != "action_evaluations"}
+    if "goal_observation" in full_context:
+        payload["goal_observation"] = {key: value
+            for key, value in full_context["goal_observation"].items() if key != "action_evaluations"}
+    return payload
 
 
 def _release_geometry(
@@ -381,6 +832,7 @@ def build_jev_decision_context_v1(
     translation_step_m: float,
     grasp_xy_tolerance_m: float,
 ) -> JevDecisionContextV1:
+    snapshot = apply_placement_action_permissions_v1(snapshot)
     if not isfinite(translation_step_m) or translation_step_m <= 0.0:
         raise ValueError("translation_step_m must be finite and positive")
     if not isfinite(grasp_xy_tolerance_m) or grasp_xy_tolerance_m <= 0.0:
@@ -417,6 +869,13 @@ def build_jev_decision_context_v1(
     subject_offset = None if centroid is None else [
         centroid[index] - snapshot.robot.tcp_position_robot_base_m[index] for index in range(3)]
     feedback = snapshot.phase_feedback
+    diagnostic = snapshot.physical.evidence.grasp_diagnostic
+    diagnostic_bound = diagnostic is not None and (
+        diagnostic.subject_ref == snapshot.skill.subject_ref
+        and diagnostic.based_on_state_id == snapshot.state_id
+        and diagnostic.based_on_action_epoch == snapshot.action_epoch
+        and diagnostic.based_on_observation_id == snapshot.visual_scene.observation_id
+        and diagnostic.timestamp_s == snapshot.timestamp_s)
 
     payload = {
         "schema": "JEVDecisionContextV1",
@@ -539,6 +998,13 @@ def build_jev_decision_context_v1(
             "held_object_ref": snapshot.physical.held_object_ref,
             "grasp_probe_lifted": snapshot.physical.evidence.grasp_probe_lifted,
             "grasp_probe_failed": snapshot.physical.evidence.grasp_probe_failed,
+            "interaction_estimate": (None if snapshot.physical.evidence.interaction_estimate is None
+                else asdict(snapshot.physical.evidence.interaction_estimate)),
+            "grasp_diagnostic": asdict(diagnostic) if diagnostic_bound else None,
+            "grasp_diagnostic_current": bool(diagnostic_bound and feedback is not None
+                and feedback.evidence_basis is not None
+                and feedback.evidence_basis.visual_evidence_current
+                and feedback.evidence_basis.robot_evidence_current),
             "evidence_sources": {
                 "contact": snapshot.physical.evidence.contact_source,
                 "grasp": snapshot.physical.evidence.grasp_source,
@@ -613,7 +1079,29 @@ def build_jev_decision_context_v1(
             },
         },
     }
-    if snapshot.skill.skill_kind == "surface_push" and snapshot.skill.phase == "establish_contact":
+    if feedback is not None and feedback.released_placement_outcome is not None:
+        released = feedback.released_placement_outcome
+        payload["phase"]["released_placement_outcome"] = {
+            "status": released.status, "reason": released.reason,
+            "goal_satisfied": released.goal_satisfied, "support_ref": released.support_ref,
+            "stable_miss_observation_count": len(released.stable_miss_samples),
+            "required_observations": released.required_observations,
+            "waiting_started_s": released.waiting_started_s,
+            "waiting_remaining_s": released.waiting_remaining_s,
+            "release_evidence": {"state_id": released.release_state_id,
+                "action_epoch": released.release_action_epoch,
+                "observation_id": released.release_observation_id,
+                "timestamp_s": released.release_timestamp_s},
+            "stable_miss_evidence": [{"state_id": s.state_id, "action_epoch": s.action_epoch,
+                "observation_id": s.observation_id, "capture_timestamp_s": s.capture_timestamp_s}
+                for s in released.stable_miss_samples],
+            "note": "Runtime classifies release outcome; goal_candidate is not final success, unknown is not a miss. Waiting and historical release evidence do not select an action or authorize a retry.",
+        }
+    if snapshot.press_event is not None:
+        payload["press_event"] = asdict(snapshot.press_event)
+    if snapshot.grasp_approach is not None:
+        payload["grasp_approach"] = grasp_approach_context_v1(snapshot)
+    if snapshot.skill.skill_kind == "surface_push" and snapshot.skill.phase in ("align_precontact", "establish_contact", "push_toward_goal"):
         sides = observed_contact_sides_v1(snapshot)
         context = snapshot.local_intent
         selected = None if context is None else (
@@ -621,9 +1109,76 @@ def build_jev_decision_context_v1(
             else None if context.handoff is None else context.handoff.candidate)
         if selected is not None and selected.contact_side is not None:
             sides = tuple(side for side in sides if side.edge_index == selected.contact_side.edge_index)
+        elif context is not None and context.push_contact_plan is not None and push_interaction_mode_v1(snapshot) == "advance":
+            side = current_push_plan_side_v1(context.push_contact_plan, snapshot)
+            sides = () if side is None else (side,)
         payload["push_contact_geometry"] = [_contact_context(snapshot, side,
             snapshot.skill.allowed_actions, translation_step_m) for side in sides]
         payload["contact_geometry_note"] = (
             "Public finite-side estimates; model chooses the side/action. A zero gap is not contact confirmation. "
             "Missing complete geometry is unknown, never zero or an old footprint presented as a new observation.")
+        payload["push_goal_progress"] = _push_goal_context(snapshot, snapshot.skill.allowed_actions, translation_step_m)
+        # 当前所有侧面均展示，不受活动侧面筛选，也不排名或选择。
+        payload["push_side_goal_counterfactuals"] = []
+        for side in observed_contact_sides_v1(snapshot):
+            delta = tuple(-translation_step_m * v for v in side.outward_normal_xy)
+            relation = _push_goal_counterfactual(snapshot, delta)
+            payload["push_side_goal_counterfactuals"].append({"side": asdict(side),
+                "assumed_subject_delta_xy_m": delta, "translated_footprint_counterfactual": relation,
+                "exit_plan_geometry": next((item for item in payload["push_goal_progress"]["current"].get(
+                    "directional_exit_requirements", ()) if item["edge_index"] == side.edge_index), None),
+                "native_goal_change": _native_push_goal_change(payload["push_goal_progress"]["current"], relation),
+                "is_observed": False, "is_physical_push_prediction": False,
+                "source": "public_footprint_translation_counterfactual"})
+        payload["push_interaction"] = {"mode": push_interaction_mode_v1(snapshot),
+            "current_measurements": current_runtime_measurements_v1(snapshot),
+            "side_plan_status": "historical_model_selection" if context is not None and context.push_contact_plan is not None else "unknown",
+            "preparation": None if context is None or context.push_preparation is None else asdict(context.push_preparation),
+            "selected_face_contact_verification": "unsupported", "path_safety": "unsupported",
+            "note": "Body contact is current evidence, not selected-face verification. Contact and original height are restoration goals when false, not restoration prerequisites. Missing/unknown prerequisites allow observation only; explicitly false support/closure/not-held prerequisites block pushing."}
+    restore_mode = placement_relation_restore_mode_v1(snapshot)
+    if snapshot.skill.skill_kind == "place" and snapshot.skill.phase == "observe_task_geometry":
+        payload["goal_observation"] = _task_observation_context(
+            snapshot, snapshot.skill.allowed_actions, translation_step_m)
+    if snapshot.skill.skill_kind == "place" and snapshot.skill.phase == "retract_after_release":
+        payload["tool_transfer_clearance"] = _tool_transfer_progress_context(
+            snapshot, snapshot.skill.allowed_actions, translation_step_m)
+    if restore_mode is not None:
+        payload["placement_height_adjustment"] = _placement_height_progress_context(
+            snapshot, snapshot.skill.allowed_actions, translation_step_m)
+        payload["placement_support_approach"] = _placement_height_progress_context(
+            snapshot, snapshot.skill.allowed_actions, translation_step_m, prefix="placement_support_approach")
+        payload["placement_relation_restore"] = {
+            "mode": restore_mode,
+            "correction_flow": None if snapshot.placement_correction is None else asdict(snapshot.placement_correction),
+            "transport_clearance_requirement": {
+                "scope": "initiated_clearance_correction_and_any_horizontal_preparation",
+                "status": ("required" if restore_mode == "restore_clearance" else
+                    "satisfied" if restore_mode == "restore_relation" else
+                    "unknown" if restore_mode == "unknown" else "not_applicable"),
+                "note": "A started clearance correction ends only after freshly reaching its original clearance goal. Its record is historical flow state, not fresh holding/clearance proof. Outside this obligation, the transport threshold is not a normal descent height goal.",
+            },
+            "current_measurements": current_runtime_measurements_v1(snapshot),
+            "available_actions": list(apply_placement_action_permissions_v1(snapshot).skill.allowed_actions),
+            "path_safety": "unsupported",
+            "note": "Current evidence, not historical transport completion. Restore clearance before horizontal correction; a restored relation completes only the local intent, not release or placement verification.",
+        }
+    if ((snapshot.skill.skill_kind == "transport" and snapshot.skill.phase == "align_target_xy")
+        or restore_mode in ("restore_relation", "placement")):
+        payload["transport_goal_progress"] = _transport_progress_context(
+            snapshot, snapshot.skill.allowed_actions, translation_step_m)
+    local = payload["local_intent"]
+    if local is not None:
+        entries = list(local["candidates"])
+        if local["execution"] is not None:
+            entries.append(local["execution"]["candidate"])
+        if local["last_termination"] is not None:
+            entries.append(local["last_termination"]["execution"]["candidate"])
+        for item in entries:
+            evidence = item.get("placement_preparation")
+            if evidence is not None:
+                evidence.pop("region_boundary_xy_m",None)
+        execution = None if snapshot.local_intent is None else snapshot.local_intent.execution
+        if execution is not None and execution.candidate.placement_preparation is not None:
+            payload["placement_preparation"] = placement_preparation_context_v1(execution.candidate,snapshot)
     return JevDecisionContextV1(payload)

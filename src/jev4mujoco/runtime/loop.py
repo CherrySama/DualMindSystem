@@ -29,6 +29,7 @@ from jev4mujoco.contracts.actions import (
     AtomicAction,
     RawStateSnapshot,
 )
+from jev4mujoco.contracts.robot_feedback import RobotFeedbackV1
 from jev4mujoco.simulation.executor import AtomicActionExecutor
 from jev4mujoco.runtime.grasp_geometry import (
     grasp_height_band_v1,
@@ -55,10 +56,11 @@ from jev4mujoco.planning.presets import build_preset_pick_and_place_plan_v1
 from jev4mujoco.runtime.verifier import RuntimeVerifierV1
 from jev4mujoco.runtime.tool_geometry import CalibratedFingerToolV1
 from jev4mujoco.runtime.verifier_config import load_runtime_verifier_config_v1
-from jev4mujoco.runtime.local_intent import LocalIntentRuntimeV1, load_local_intent_config_v1
+from jev4mujoco.runtime.local_intent import LocalIntentRuntimeV1, PlacementCorrectionRuntimeV1, load_local_intent_config_v1, apply_placement_action_permissions_v1
 from jev4mujoco.runtime.transitions import active_skill_state_v2
+from jev4mujoco.runtime.press_event import PressEventRuntimeV1, press_event_observed_v1
 from jev4mujoco.contracts.local_intent import LocalIntentCandidateV1
-from jev4mujoco.contracts.state_snapshot import DecisionFeedbackV1, StateSnapshotV2, PhaseFeedbackV1
+from jev4mujoco.contracts.state_snapshot import DecisionFeedbackV1, StateSnapshotV2, PhaseFeedbackV1, GraspState
 from jev4mujoco.contracts.task_plan import TaskPlanV1
 from jev4mujoco.contracts.visual_scene import VisualSceneV1, Visibility
 
@@ -72,7 +74,6 @@ from jev4mujoco.experiments.results import (
 from jev4mujoco.experiments.evaluation import (
     evaluate_pick_and_place,
     evaluate_multi_object_regions,
-    quaternion_rotation,
 )
 
 class BlockPickPlaceRuntimeV1:
@@ -136,15 +137,26 @@ class BlockPickPlaceRuntimeV1:
             ),
             relation_config=self._verifier_config.visual_relation_config,
             button_press_minimum_travel_m=(
-                self._verifier_config.press_minimum_travel_m
-                + self._verifier_config.press_visual_confirmation_margin_m
+                self._verifier_config.press_visual_confirmation_margin_m
             ),
         )
         self._executor = AtomicActionExecutor(self.backend, self.config)
         self._tool_calibration = CalibratedFingerToolV1.from_model(self.backend.model, self.config.tcp_site)
         self._policy: CapabilityPolicyV1 | None = None
         self._local_intent_runtime = LocalIntentRuntimeV1(load_local_intent_config_v1(
-            self._root / "configs/local_intent_v1.yaml"))
+            self._root / "configs/local_intent_v1.yaml"),
+            placement_preparation_step_m=self.config.cartesian_step_m,
+            placement_preparation_tolerance_m=self.config.translation_error_m)
+        from jev4mujoco.runtime.grasp_observation import GraspObservationRuntimeV1
+        self._grasp_observation_runtime = GraspObservationRuntimeV1(
+            self._local_intent_runtime.config, self._verifier_config.grasp_xy_tolerance_m,
+            self.config.translation_error_m, self._verifier_config.max_visual_age_s,
+            self.config.gripper_open_joint_m, self._verifier_config.gripper_tolerance_m)
+        self._placement_correction_runtime = PlacementCorrectionRuntimeV1()
+        self._press_event_runtime = PressEventRuntimeV1(
+            self._verifier_config.press_visual_confirmation_margin_m,
+            self._verifier_config.press_point_xy_tolerance_m,
+            self._verifier_config.max_visual_age_s)
         self._state_builder = LiveStateSnapshotBuilderV2(
             LiveStateConfigV2(
                 gripper_open_joint_m=self.config.gripper_open_joint_m,
@@ -152,6 +164,8 @@ class BlockPickPlaceRuntimeV1:
                 gripper_position_tolerance_m=self._verifier_config.gripper_tolerance_m,
                 grasp_xy_tolerance_m=self._verifier_config.grasp_xy_tolerance_m,
                 minimum_blocked_gripper_joint_m=0.003,
+                maximum_visual_age_s=self._verifier_config.max_visual_age_s,
+                support_height_tolerance_m=self._verifier_config.visual_relation_config.support_height_tolerance_m,
             ), self._tool_calibration,
         )
         self._observation_id = 0
@@ -172,8 +186,8 @@ class BlockPickPlaceRuntimeV1:
         self._recovery_stop_reason: str | None = None
 
         # Reset only forwards constraints; a short settle makes physical support observable.
-        self.backend.step(100)
-        first_raw = self.backend.snapshot()
+        self.backend.step_robot(100)
+        first_raw = self.backend.robot_feedback()
         first_scene = self._capture_scene(first_raw)
         visual_refs = {entity.track_id for entity in first_scene.entities}
         missing = set(object_body_names) - visual_refs
@@ -196,7 +210,7 @@ class BlockPickPlaceRuntimeV1:
         self._verifier = RuntimeVerifierV1(self._verifier_config)
         self._capability_runtime = CapabilityRuntimeV1(self.program, self._verifier)
         self._last_state = self._state_builder.build(
-            raw=first_raw,
+            robot_feedback=first_raw,
             visual_scene=first_scene,
             task_plan=self.task_plan,
             program=self.program,
@@ -228,21 +242,26 @@ class BlockPickPlaceRuntimeV1:
                 ),
                 grasp_xy_tolerance_m=self._verifier_config.grasp_xy_tolerance_m,
                 minimum_blocked_gripper_joint_m=0.003,
+                maximum_visual_age_s=self._verifier_config.max_visual_age_s,
+                support_height_tolerance_m=self._verifier_config.visual_relation_config.support_height_tolerance_m,
             ), self._tool_calibration,
         )
         self._recent_action = None
         self._decision_feedback = None
         self._previous_phase_feedback = None
         self._local_intent_runtime.reset()
+        self._placement_correction_runtime.reset()
         self._pending_xy_alignment_review = None
         self._review_phase_key = None
         self._consecutive_rejections = 0
         self._consecutive_nonprogress_actions = 0
         self._progress_block_reason = None
         self._events.clear()
-        raw = self.backend.snapshot()
+        self._press_event_runtime.reset()
+        self._grasp_observation_runtime.reset()
+        raw = self.backend.robot_feedback()
         self._last_state = self._state_builder.build(
-            raw=raw,
+            robot_feedback=raw,
             visual_scene=initial_scene,
             task_plan=self.task_plan,
             program=self.program,
@@ -335,8 +354,6 @@ class BlockPickPlaceRuntimeV1:
                     continue
                 break
             execution = self._capability_runtime.execution
-            if execution.status is CapabilityProgramStatus.COMPLETED:
-                break
             if execution.status is CapabilityProgramStatus.BLOCKED:
                 blocked_reason = execution.blocked_reason or "capability runtime blocked"
                 decision_count += 1
@@ -367,7 +384,7 @@ class BlockPickPlaceRuntimeV1:
                             pending_verification_key = None
                             continue
                         break
-                    self.backend.step(max(1, ceil(0.1 / self.backend.physics_dt_s)))
+                    self.backend.step_robot(max(1, ceil(0.1 / self.backend.physics_dt_s)))
                 continue
 
             step_state = execution.steps[execution.active_step_index]
@@ -390,7 +407,7 @@ class BlockPickPlaceRuntimeV1:
                         if snapshot.skill.phase == "verify_push_goal"
                         else 0.02
                     )
-                    self.backend.step(max(1, ceil(wait_s / self.backend.physics_dt_s)))
+                    self.backend.step_robot(max(1, ceil(wait_s / self.backend.physics_dt_s)))
                 continue
 
             update = self._capability_runtime.probe_active_phase(snapshot)
@@ -413,7 +430,7 @@ class BlockPickPlaceRuntimeV1:
                     if snapshot.skill.phase == "verify_push_goal"
                     else 0.02
                 )
-                self.backend.step(max(1, ceil(wait_s / self.backend.physics_dt_s)))
+                self.backend.step_robot(max(1, ceil(wait_s / self.backend.physics_dt_s)))
                 continue
 
             decision = self._policy.decide(snapshot)
@@ -433,7 +450,7 @@ class BlockPickPlaceRuntimeV1:
             if getattr(self._policy, "jev_stages", 1) == 2:
                 try:
                     if (decision.local_intent_choice is None
-                        or self.backend.snapshot().state_id != snapshot.state_id
+                        or self.backend.robot_feedback().state_id != snapshot.state_id
                         or decision.based_on_state_id != snapshot.state_id
                         or decision.based_on_action_epoch != snapshot.action_epoch):
                         raise ValueError("two-stage action lacks a fresh local intent binding")
@@ -447,6 +464,7 @@ class BlockPickPlaceRuntimeV1:
                     continued = (snapshot.local_intent.execution is not None
                         and snapshot.local_intent.execution.status == "active")
                     self._record("local_intent_continued" if continued else "local_intent_selected", execution)
+                    snapshot = self._grasp_observation_runtime.select(execution.candidate, snapshot)
                     snapshot = replace(snapshot, local_intent=self._local_intent_runtime.context(snapshot))
                 except ValueError as error:
                     blocked_reason = str(error)
@@ -485,7 +503,15 @@ class BlockPickPlaceRuntimeV1:
                 self._pending_xy_alignment_review = (review, result, candidate)
             if result.status in (ActionStatus.REJECTED, ActionStatus.FAILED, ActionStatus.TIMED_OUT):
                 blocked_reason = result.reason or f"atomic action {result.status.value}"
-                if recover(self._fresh_state(), blocked_reason):
+                after_action = self._fresh_state()
+                if (result.status is ActionStatus.TIMED_OUT and snapshot.skill.phase == "press_button"
+                    and press_event_observed_v1(after_action, snapshot.skill.subject_ref, snapshot.skill.target_ref) is True):
+                    update = self._capability_runtime.probe_active_phase(after_action)
+                    self._record("capability_runtime", update)
+                    self._attach_phase_feedback(after_action, update)
+                    # 保留超时结果，停止本次执行；不继续受阻下压或执行后续能力。
+                    break
+                if recover(after_action, blocked_reason):
                     continue
                 break
 
@@ -500,7 +526,9 @@ class BlockPickPlaceRuntimeV1:
         )
         runtime_success = capability_success and task_completion_success
         hidden = self._hidden_truth(self.backend.snapshot())
-        if runtime_success and hidden.success:
+        if runtime_success and hidden.success and blocked_reason is not None:
+            reason = f"task goal confirmed; execution stopped: {blocked_reason}"
+        elif runtime_success and hidden.success:
             reason = "runtime verifier and hidden MuJoCo truth both passed"
         elif blocked_reason is not None:
             reason = blocked_reason
@@ -510,6 +538,8 @@ class BlockPickPlaceRuntimeV1:
             reason = f"runtime passed but hidden truth failed: {hidden.reason}"
         else:
             reason = "capability program did not complete"
+        self._placement_correction_runtime.reset()
+        final_state = replace(final_state, placement_correction=None)
         if getattr(self._policy, "jev_stages", 1) == 2:
             termination = self._local_intent_runtime.stop(final_state, reason)
             if termination is not None:
@@ -528,6 +558,14 @@ class BlockPickPlaceRuntimeV1:
             final_state=final_state,
             final_raw_state=self.backend.snapshot(),
             events=tuple(self._events),
+            execution_anomalies=tuple(event.payload for event in self._events
+                if event.kind == "action_result" and event.payload.status in (
+                    ActionStatus.REJECTED, ActionStatus.FAILED, ActionStatus.TIMED_OUT)),
+            execution_stop_reason=blocked_reason,
+            autonomous_success=runtime_success and hidden.success and not any(
+                event.kind == "action_result" and event.payload.status in (
+                    ActionStatus.REJECTED, ActionStatus.FAILED, ActionStatus.TIMED_OUT)
+                for event in self._events),
         )
 
     def _attempt_recovery(self, snapshot: StateSnapshotV2, reason: str) -> bool:
@@ -550,7 +588,7 @@ class BlockPickPlaceRuntimeV1:
         if (
             decision.based_on_state_id != snapshot.state_id
             or decision.based_on_action_epoch != snapshot.action_epoch
-            or self.backend.snapshot().state_id != snapshot.state_id
+            or self.backend.robot_feedback().state_id != snapshot.state_id
         ):
             self._record("recovery_rejected", "stale recovery decision")
             return False
@@ -563,7 +601,7 @@ class BlockPickPlaceRuntimeV1:
             return False
         if decision.choice is RecoveryChoiceV1.OBSERVE:
             self._recovery_observations += 1
-            self.backend.step(max(1, ceil(0.1 / self.backend.physics_dt_s)))
+            self.backend.step_robot(max(1, ceil(0.1 / self.backend.physics_dt_s)))
             return True
         try:
             update = (self._capability_runtime.restart_current_placement_chain(snapshot)
@@ -572,17 +610,21 @@ class BlockPickPlaceRuntimeV1:
         except ValueError as error:
             self._record("recovery_rejected", str(error))
             self._recovery_observations += 1
-            self.backend.step(max(1, ceil(0.1 / self.backend.physics_dt_s)))
+            self.backend.step_robot(max(1, ceil(0.1 / self.backend.physics_dt_s)))
             return True
         self.program = self._capability_runtime.program
         if snapshot.physical.held_object_ref is None:
             self._state_builder.reset_for_retry()
         self._retry_count += 1
+        self._verifier.reset_released_placement()
+        self._press_event_runtime.reset()
+        self._grasp_observation_runtime.reset()
         self._recovery_observations = 0
         self._recent_action = None
         self._decision_feedback = None
         self._previous_phase_feedback = None
         self._local_intent_runtime.reset()
+        self._placement_correction_runtime.reset()
         self._pending_xy_alignment_review = None
         self._review_phase_key = None
         self._consecutive_rejections = 0
@@ -608,7 +650,7 @@ class BlockPickPlaceRuntimeV1:
 
     def _fresh_state(self) -> StateSnapshotV2:
         self._sync_active_object()
-        raw = self.backend.snapshot()
+        raw = self.backend.robot_feedback()
         scene = (
             self._last_visual_scene
             if self._last_capture_state_id == raw.state_id
@@ -617,7 +659,7 @@ class BlockPickPlaceRuntimeV1:
         if scene is None:
             raise RuntimeError("live visual scene cache is unexpectedly empty")
         self._last_state = self._state_builder.build(
-            raw=raw,
+            robot_feedback=raw,
             visual_scene=scene,
             task_plan=self.task_plan,
             program=self.program,
@@ -637,6 +679,8 @@ class BlockPickPlaceRuntimeV1:
         self._last_state = replace(
             self._last_state, decision_feedback=self._decision_feedback
         )
+        self._last_state = self._press_event_runtime.attach(self._last_state, self._recent_action)
+        self._last_state = self._grasp_observation_runtime.attach(self._last_state, self._recent_action)
         self._record("state_snapshot", self._last_state)
         return self._last_state
 
@@ -648,6 +692,9 @@ class BlockPickPlaceRuntimeV1:
         feedback = self._capability_runtime.phase_feedback(
             snapshot, update.verification, self._previous_phase_feedback)
         snapshot = replace(snapshot, phase_feedback=feedback)
+        snapshot = self._placement_correction_runtime.attach(snapshot)
+        snapshot = apply_placement_action_permissions_v1(snapshot)
+        feedback = snapshot.phase_feedback
         if getattr(self._policy, "jev_stages", 1) == 2:
             if update.event_kind in (CapabilityRuntimeEventKind.PHASE_ADVANCED,
                 CapabilityRuntimeEventKind.CAPABILITY_COMPLETED, CapabilityRuntimeEventKind.PROGRAM_COMPLETED,
@@ -675,6 +722,12 @@ class BlockPickPlaceRuntimeV1:
         if decision.action is None:
             raise ValueError("action decision has no atomic action")
         error = active_xy_alignment_error_v1(snapshot)
+        candidate = (None if snapshot.local_intent is None or snapshot.local_intent.execution is None
+            else snapshot.local_intent.execution.candidate)
+        if candidate is not None and candidate.placement_preparation is not None and decision.action is AtomicAction.HOLD:
+            return DecisionFeedbackV1(decision.decision_id, decision.action.value, snapshot.skill.phase,
+                "accepted", "observe current placement preparation effect; HOLD does not complete preparation",
+                error.distance_m, error.distance_m)
         step = (grasp_translation_step_v1(snapshot, snapshot.skill.subject_ref, decision.action,
             self.config.cartesian_step_m) if snapshot.skill.phase == "descend_to_grasp"
             else self.config.cartesian_step_m)
@@ -729,6 +782,40 @@ class BlockPickPlaceRuntimeV1:
             return None
         if decision.action is None:
             raise ValueError("action decision has no atomic action")
+        from jev4mujoco.runtime.grasp_observation import (grasp_recovery_mode_v1, grasp_observation_motion_ready_v1,
+            grasp_preparation_ready_v1, grasp_preparation_options_v1)
+        mode = grasp_recovery_mode_v1(snapshot)
+        if mode in ("observe", "unknown"):
+            accepted = decision.action is AtomicAction.HOLD or (
+                mode == "observe" and decision.action is AtomicAction.UP
+                and grasp_observation_motion_ready_v1(snapshot))
+            return DecisionFeedbackV1(decision.decision_id, decision.action.value, snapshot.skill.phase,
+                "accepted" if accepted else "rejected",
+                "grasp observation action; future visibility requires fresh measurement" if accepted
+                else "current grasp observation prerequisites do not permit this action", None, None)
+        if mode == "prepare" and decision.action in (AtomicAction.UP,AtomicAction.DOWN,AtomicAction.GRIPPER_CLOSE):
+            return DecisionFeedbackV1(decision.decision_id,decision.action.value,snapshot.skill.phase,
+                "rejected","model-selected preparation must be freshly completed before grasp height correction",None,None)
+        if mode == "prepare" and decision.action is AtomicAction.HOLD:
+            return DecisionFeedbackV1(decision.decision_id,decision.action.value,snapshot.skill.phase,
+                "accepted","observe current preparation prerequisites; holding does not complete preparation",None,None)
+        if mode == "prepare" and snapshot.local_intent is None and decision.action in (
+            AtomicAction.FORWARD, AtomicAction.BACKWARD, AtomicAction.LEFT, AtomicAction.RIGHT):
+            from jev4mujoco.contracts.actions import TRANSLATION_DIRECTIONS_ROBOT_BASE
+            r, tcp = snapshot.grasp_approach, snapshot.robot.tcp_position_robot_base_m
+            step = grasp_translation_step_v1(snapshot, snapshot.skill.subject_ref, decision.action, self.config.cartesian_step_m)
+            direction = TRANSLATION_DIRECTIONS_ROBOT_BASE[decision.action]
+            projected_tcp = tuple(x + step*d for x,d in zip(tcp,direction))
+            center = r.current.centroid_robot_base_m
+            options = grasp_preparation_options_v1(snapshot,r.xy_tolerance_m,r.preparation_tolerance_m)
+            accepted = (grasp_preparation_ready_v1(snapshot) and center is not None
+                and hypot(projected_tcp[0]-center[0],projected_tcp[1]-center[1]) <= r.xy_tolerance_m+1e-12
+                and any(hypot(target[0]-tcp[0],target[1]-tcp[1])
+                    - hypot(target[0]-projected_tcp[0],target[1]-projected_tcp[1]) >= self._local_intent_runtime.config.minimum_progress_m
+                    for _,target,_,_ in options))
+            return DecisionFeedbackV1(decision.decision_id,decision.action.value,snapshot.skill.phase,
+                "accepted" if accepted else "rejected", "model-selected atomic preparation within original grasp XY tolerance"
+                if accepted else "preparation action does not preserve original XY tolerance or improve a current option",None,None)
         band = grasp_height_band_v1(snapshot, snapshot.skill.subject_ref)
         subject = next(
             (entity for entity in snapshot.visual_scene.entities
@@ -851,9 +938,9 @@ class BlockPickPlaceRuntimeV1:
                 self.program.steps[-1],
             )
         if instance.subject_ref in self.backend.object_body_names:
-            self.backend.select_active_object(instance.subject_ref)
+            self.backend.select_active_object(instance.subject_ref, robot_only=True)
 
-    def _capture_scene(self, raw: RawStateSnapshot):
+    def _capture_scene(self, raw: RobotFeedbackV1):
         self._observation_id += 1
         scene = self.backend.capture_fixed_rgbd(
             self._visual_builder,
@@ -880,6 +967,8 @@ class BlockPickPlaceRuntimeV1:
     def _execute(self, decision: CapabilityDecisionV1, snapshot: StateSnapshotV2) -> ActionResult:
         if decision.action is None:
             raise ValueError("action decision has no atomic action")
+        if decision.action.value not in apply_placement_action_permissions_v1(snapshot).skill.allowed_actions:
+            raise ValueError("action violates current Runtime phase permissions")
         translation_step_m = None
         if snapshot.skill.phase == "descend_to_grasp" and decision.action in (
             AtomicAction.FORWARD, AtomicAction.BACKWARD,
@@ -897,6 +986,8 @@ class BlockPickPlaceRuntimeV1:
                 based_on_action_epoch=decision.based_on_action_epoch,
                 action=decision.action,
                 translation_step_m=translation_step_m,
+                held_object_estimate=(None if snapshot.physical.grasp_state is GraspState.UNKNOWN
+                    else snapshot.physical.grasp_state is GraspState.HELD),
             )
         )
 
@@ -907,10 +998,6 @@ class BlockPickPlaceRuntimeV1:
         self, destinations: dict[str, str]
     ) -> MultiObjectHiddenTruthResultV1:
         return evaluate_multi_object_regions(self, destinations)
-
-    @staticmethod
-    def _quaternion_rotation(quaternion_wxyz: tuple[float, float, float, float]) -> NDArray[np.float64]:
-        return quaternion_rotation(quaternion_wxyz)
 
     def _record(self, kind: str, payload: object) -> None:
         event = BlockRuntimeEventV1(kind=kind, payload=payload)
@@ -931,7 +1018,7 @@ class BlockPickPlaceRuntimeV1:
             raise ValueError("idle video tail duration must be nonnegative")
         if duration_s == 0.0:
             return
-        self.backend.step(ceil(duration_s / self.backend.physics_dt_s))
+        self.backend.step_robot(ceil(duration_s / self.backend.physics_dt_s))
 
     def __enter__(self) -> BlockPickPlaceRuntimeV1:
         return self

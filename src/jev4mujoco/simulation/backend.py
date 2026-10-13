@@ -10,6 +10,7 @@ from numpy.typing import NDArray
 
 from jev4mujoco.simulation.config import StageConfig
 from jev4mujoco.contracts.actions import PhysicalContactSnapshot, RawStateSnapshot
+from jev4mujoco.contracts.robot_feedback import RobotFeedbackV1
 
 if TYPE_CHECKING:
     from jev4mujoco.perception.fixed_rgbd import (
@@ -160,6 +161,8 @@ class MujocoBackend:
         self._state_id = 0
         self._action_epoch = 0
         self._frame_sink = frame_sink
+        self._evaluation_observer = None
+        self.evaluation_observer_error: str | None = None
         self._video_period_s = 1.0 / video_fps
         self._next_frame_time_s = 0.0
         self._renderer: mujoco.Renderer | None = None
@@ -216,7 +219,7 @@ class MujocoBackend:
     def object_body_names(self) -> tuple[str, ...]:
         return tuple(self._object_metadata)
 
-    def select_active_object(self, body_name: str) -> RawStateSnapshot:
+    def select_active_object(self, body_name: str, *, robot_only=False):
         """Select which object is projected through the legacy single-object raw state."""
         self._assert_owner()
         if body_name not in self._object_metadata:
@@ -225,7 +228,7 @@ class MujocoBackend:
             self._active_object_body = body_name
             self._select_object_metadata(body_name)
             self._state_id += 1
-        return self.snapshot()
+        return self.robot_feedback() if robot_only else self.snapshot()
 
     @property
     def physics_dt_s(self) -> float:
@@ -276,6 +279,24 @@ class MujocoBackend:
         self._action_epoch = 0
         self._state_id += 1
         return self.snapshot()
+
+    def robot_feedback(self) -> RobotFeedbackV1:
+        """模拟编码器与机器人运动学反馈；不读取物体位姿、碰撞或接触力。"""
+        self._assert_owner()
+        base_rotation = self._data.xmat[self._base_body_id].reshape(3, 3)
+        tcp_world = self._data.site_xpos[self._tcp_site_id]
+        tcp_base = base_rotation.T @ (tcp_world - self._data.xpos[self._base_body_id])
+        rotation = base_rotation.T @ self._data.site_xmat[self._tcp_site_id].reshape(3, 3)
+        quaternion = np.empty(4)
+        mujoco.mju_mat2Quat(quaternion, rotation.ravel())
+        return RobotFeedbackV1(self._state_id, self._action_epoch, float(self._data.time),
+            tuple(float(v) for v in self._data.qpos[self._arm_qpos_addresses]),
+            tuple(float(v) for v in self._data.qvel[self._arm_dof_addresses]),
+            float(self._data.qpos[self._gripper_qpos_address]),
+            float(self._data.ctrl[self._gripper_actuator_id]),
+            tuple(float(v) for v in tcp_world), tuple(float(v) for v in tcp_base),
+            tuple(float(v) for v in quaternion),
+            float(self._data.qpos[self._right_gripper_qpos_address]))
 
     def snapshot(self) -> RawStateSnapshot:
         self._assert_owner()
@@ -390,6 +411,23 @@ class MujocoBackend:
             @ self._data.xmat[self._base_body_id].reshape(3, 3)
         )
 
+    def evaluation_object_support_contact(self, subject_ref: str, geom_name: str) -> bool:
+        """Hidden evaluation only: actual load-bearing contact with a named geom.
+
+        This is not part of RobotFeedbackV1 or the online state estimator.
+        """
+        self._assert_owner()
+        object_geoms = self._object_metadata[subject_ref][3]
+        support_id = self._named_id(mujoco.mjtObj.mjOBJ_GEOM, geom_name)
+        for index, contact in enumerate(self._data.contact):
+            pair = frozenset((int(contact.geom1), int(contact.geom2)))
+            if support_id in pair and pair & object_geoms:
+                force = np.zeros(6, dtype=np.float64)
+                mujoco.mj_contactForce(self._model, self._data, index, force)
+                if abs(float(force[0])) > 0.0:
+                    return True
+        return False
+
     def _contact_snapshot(self) -> PhysicalContactSnapshot:
         left_force = 0.0
         right_force = 0.0
@@ -476,20 +514,41 @@ class MujocoBackend:
         self._data.ctrl[self._gripper_actuator_id] = target_m
 
     def step(self, count: int = 1) -> RawStateSnapshot:
+        self._step_physics(count)
+        return self.snapshot()
+
+    def _step_physics(self, count):
         self._assert_owner()
         if count <= 0:
             raise ValueError("step count must be positive")
         for _ in range(count):
             mujoco.mj_step(self._model, self._data)
             self._capture_frame()
+            if self._evaluation_observer is not None:
+                try:
+                    # 只供隔离裁判记录轨迹；返回值不参与控制、在线观测或动作许可。
+                    self._evaluation_observer(self.snapshot())
+                except Exception as error:
+                    self.evaluation_observer_error = f"{type(error).__name__}: {error}"
+                    self._evaluation_observer = None
         self._state_id += 1
-        return self.snapshot()
 
-    def commit_action(self) -> RawStateSnapshot:
+    def install_evaluation_observer(self, observer: Callable[[RawStateSnapshot], None]) -> None:
+        self._assert_owner()
+        if self._evaluation_observer is not None:
+            raise ValueError("an evaluation observer is already installed")
+        self._evaluation_observer = observer
+        self.evaluation_observer_error = None
+
+    def step_robot(self, count: int = 1) -> RobotFeedbackV1:
+        self._step_physics(count)
+        return self.robot_feedback()
+
+    def commit_robot_action(self) -> RobotFeedbackV1:
         self._assert_owner()
         self._action_epoch += 1
         self._state_id += 1
-        return self.snapshot()
+        return self.robot_feedback()
 
     def _capture_frame(self, force: bool = False) -> None:
         if self._renderer is None or self._frame_sink is None:

@@ -69,15 +69,17 @@ def _save_summary(directory: Path, records: list[EpisodeStatisticsV1], planned: 
              f"已结束 {len(records)}/{planned} 回合；双重验收成功 {totals['successes']}，"
              f"首次成功 {totals['direct_successes']}，经恢复成功 {totals['recovered_successes']}，"
              f"运行错误 {totals['run_errors']}。", "",
+             f"裁判任务达成 {totals['task_achievements']}；在线目标确认 {totals['online_goal_confirmations']}；"
+             f"无执行异常的完整自主成功 {totals['autonomous_successes']}。双重验收达成不掩盖执行异常。", "",
              "每个回合对应一段视频，内部重试不另计回合。固定场景的一次运行仅说明本次结果。", "",
-             "| 实验 | 轮次 | Runtime | 物理验收 | 重试请求/实际重启 | 决策 | 视频与事件 |",
-             "| --- | ---: | --- | --- | ---: | ---: | --- |"]
+             "| 实验 | 轮次 | Runtime | 裁判任务效果 | 执行异常数 | 重试请求/实际重启 | 决策 | 视频与事件 |",
+             "| --- | ---: | --- | --- | ---: | ---: | ---: | --- |"]
     def verdict(value: bool | None) -> str:
         return "未知" if value is None else "通过" if value else "未通过"
     for record in records:
         video = f"[视频]({record.video_path})" if record.video_path else "视频缺失"
         lines.append(f"| {record.task} | {record.episode} | {verdict(record.runtime_success)} | "
-                     f"{verdict(record.hidden_success)} | {record.retry_pick_requests + record.retry_capability_requests}/{record.actual_retry_count} | "
+                     f"{verdict(record.hidden_success)} | {record.execution_error_count} | {record.retry_pick_requests + record.retry_capability_requests}/{record.actual_retry_count} | "
                      f"{record.decision_count if record.decision_count is not None else '未知'} | "
                      f"{video} · [事件]({record.events_path}) · [统计]({record.run_directory}/statistics.json) |")
     lines.extend(["", "实际重试计数来自 Runtime 的 recovery_reset；抓取链、推动和按压均计入每任务的共同额度。"

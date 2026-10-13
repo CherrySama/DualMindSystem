@@ -41,6 +41,10 @@ class EpisodeStatisticsV1:
     result_path: str
     events_path: str
     log_path: str
+    task_achieved: bool | None = None
+    online_goal_status: str | None = None
+    autonomous_success: bool | None = None
+    execution_stop_reason: str | None = None
 
 
 def collect_episode_statistics_v1(
@@ -165,6 +169,10 @@ def collect_episode_statistics_v1(
         action_counts=dict(actions), recovery_events=tuple(recovery_events),
         video_path=video_path, result_path=str(result_path),
         events_path=str(events_path), log_path=str(directory / "process.log"),
+        task_achieved=hidden,
+        online_goal_status=result.get("online_goal_status", "confirmed" if runtime else "unconfirmed"),
+        autonomous_success=(None if errors else bool(overall and not execution_errors and not interface_errors)),
+        execution_stop_reason=result.get("execution_stop_reason"),
     )
 
 
@@ -178,6 +186,9 @@ def aggregate_episode_statistics_v1(records: list[EpisodeStatisticsV1]) -> dict:
         "valid_results": sum(record.run_error is None for record in records),
         "run_errors": sum(record.run_error is not None for record in records),
         "successes": success,
+        "task_achievements": sum(record.task_achieved is True for record in records),
+        "online_goal_confirmations": sum(record.runtime_success is True for record in records),
+        "autonomous_successes": sum(record.autonomous_success is True for record in records),
         "success_rate": success / count if count else None,
         "direct_successes": groups["direct"],
         "recovered_successes": groups["regrasp_recovery"] + groups["recovery_without_regrasp"],

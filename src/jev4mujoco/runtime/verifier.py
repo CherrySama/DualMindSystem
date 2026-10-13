@@ -28,7 +28,9 @@ from jev4mujoco.contracts.state_snapshot import (
     PhaseObservationBasisV1,
 )
 from jev4mujoco.runtime.grasp_geometry import grasp_pose_correction_v1
-from jev4mujoco.runtime.progress import pick_xy_error_v1
+from jev4mujoco.runtime.tool_geometry import tool_transfer_clearance_v1
+from jev4mujoco.runtime.observation_geometry import task_observation_geometry_v1
+from jev4mujoco.runtime.progress import pick_xy_error_v1, placement_horizontal_measurements_v1
 from jev4mujoco.perception.surface_geometry import (
     footprint_clear_of_region_v1,
     polygon_contains_polygon_v1,
@@ -46,6 +48,8 @@ from jev4mujoco.planning.phase_definitions import (
     PHASE_DEFINITIONS_V1, GOAL_DEFINITIONS_V1, PHASE_CONDITION_SPECS_V1,
     PHASE_CONSTRAINT_SPECS_V1,
 )
+from jev4mujoco.contracts.released_placement import ReleasedPlacementOutcomeV1
+from jev4mujoco.runtime.released_placement import ReleasedPlacementRuntimeV1
 
 @dataclass(frozen=True, slots=True)
 class VerificationResultV1:
@@ -58,6 +62,7 @@ class VerificationResultV1:
     based_on_skill: SkillStateV2
     consecutive_pass_count: int = 0
     required_consecutive_passes: int = 1
+    released_placement_outcome: ReleasedPlacementOutcomeV1 | None = None
 
 
 class RuntimeVerifierV1:
@@ -65,6 +70,7 @@ class RuntimeVerifierV1:
 
     def __init__(self, config: RuntimeVerifierConfigV1) -> None:
         self._config = config
+        self._released_placement_runtime = ReleasedPlacementRuntimeV1(config)
         self._placement_history: dict[
             tuple[str, str], tuple[int, int, tuple[float, float, float], float]
         ] = {}
@@ -72,6 +78,9 @@ class RuntimeVerifierV1:
             tuple[str, str], tuple[int, int, tuple[float, float, float], float]
         ] = {}
         self._grasp_confirmation_started_s: dict[str, float] = {}
+
+    def reset_released_placement(self) -> None:
+        self._released_placement_runtime.reset()
 
     def verify_final_region_goals(
         self, snapshot: StateSnapshotV2, goals: tuple[tuple[str, str], ...],
@@ -199,6 +208,7 @@ class RuntimeVerifierV1:
             or snapshot.skill.skill_kind != expected_skill.skill_kind
             or snapshot.skill.phase != expected_skill.phase
             or snapshot.skill.status is not expected_skill.status
+            or not PhaseObservationBasisV1.same_scope(snapshot.skill, expected_skill)
         ):
             phase = template.phases[step_state.phase_index]
             return self._failed(
@@ -209,16 +219,32 @@ class RuntimeVerifierV1:
 
         phase = template.phases[step_state.phase_index]
         contract_id = phase.completion_contract
+        basis = self._phase_evidence_basis(snapshot)
+        released = self._released_placement_runtime.observe(snapshot,
+            visual_current=basis.visual_evidence_current, robot_current=basis.robot_evidence_current)
+        if released is not None and released.status == "stable_goal_miss":
+            return replace(self._failed(contract_id, snapshot,
+                f"{released.status}: {released.reason}; goal={released.goal_satisfied}, support={released.support_ref}"),
+                released_placement_outcome=released)
         if phase.requires_fresh_visual and (
             not snapshot.freshness.visual_is_fresh
             or snapshot.freshness.visual_age_s > self._config.max_visual_age_s
         ):
-            return self._pending(contract_id, snapshot, "fresh visual state required")
-
-        handler = getattr(self, f"_verify_{contract_id}", None)
-        if handler is None:
-            return self._failed(contract_id, snapshot, "unknown phase contract")
-        return handler(instance, snapshot)
+            result = self._pending(contract_id, snapshot, "fresh visual state required")
+        else:
+            handler = getattr(self, f"_verify_{contract_id}", None)
+            if handler is None:
+                return self._failed(contract_id, snapshot, "unknown phase contract")
+            result = handler(instance, snapshot)
+        if released is not None:
+            if released.status == "observation_timeout" and result.outcome is VerificationOutcome.PENDING:
+                result = self._failed(contract_id, snapshot,
+                    f"observation_timeout: {released.reason}; goal={released.goal_satisfied}, support={released.support_ref}")
+            elif result.outcome is VerificationOutcome.PASSED:
+                self._released_placement_runtime.end_observation_wait()
+                released = replace(released, waiting_started_s=None, waiting_remaining_s=None,
+                    status="goal_candidate" if released.status == "observation_timeout" else released.status)
+        return replace(result, released_placement_outcome=released)
 
     def _verify_gripper_open_v1(
         self, instance: CapabilityInstanceV1, snapshot: StateSnapshotV2
@@ -327,6 +353,7 @@ class RuntimeVerifierV1:
             previous_action_epoch=previous.based_on_action_epoch if same_phase else None,
             consecutive_pass_count=result.consecutive_pass_count,
             required_consecutive_passes=result.required_consecutive_passes,
+            released_placement_outcome=result.released_placement_outcome,
         )
 
     def _phase_evidence_basis(self, snapshot: StateSnapshotV2) -> PhaseEvidenceBasisV1:
@@ -347,6 +374,9 @@ class RuntimeVerifierV1:
     @staticmethod
     def _measurement_evidence_current(measurement, snapshot, basis) -> bool:
         source = measurement.source
+        if source == "runtime_press_event_history":
+            from jev4mujoco.runtime.press_event import press_event_observed_v1
+            return press_event_observed_v1(snapshot, snapshot.skill.subject_ref, snapshot.skill.target_ref) is not None
         if source == "unknown":
             return False
         if source in ("command", "deployment_configuration", "runtime_observation_history"):
@@ -455,8 +485,14 @@ class RuntimeVerifierV1:
                 if item.subject_ref == instance.subject_ref
                 and item.reference_ref == instance.goal.reference_ref
                 and item.predicate is instance.goal.predicate), None)
-            add("final_goal_relation", None if relation is None else relation.value, source="rgbd_relation")
-            goal_satisfied = None if relation is None else relation.value is instance.goal.desired_value
+            relation_value = None if relation is None else relation.value
+            goal_source = "rgbd_relation"
+            if instance.goal.predicate is VisualPredicate.PRESSED:
+                from jev4mujoco.runtime.press_event import press_event_observed_v1
+                relation_value = press_event_observed_v1(snapshot, instance.subject_ref, instance.goal.reference_ref)
+                goal_source = "runtime_press_event_history"
+            add("final_goal_relation", relation_value, source=goal_source)
+            goal_satisfied = None if relation_value is None else relation_value is instance.goal.desired_value
             if instance.goal.predicate is VisualPredicate.CLEAR_OF_REGION:
                 entity = self._entity(snapshot, instance.subject_ref)
                 region = self._region(snapshot, instance.goal.reference_ref)
@@ -464,11 +500,32 @@ class RuntimeVerifierV1:
                     and region is not None and region.geometry.boundary_xy_robot_base_m is not None
                     and region.geometry.boundary_xy_robot_base_m.value is not None)
                 goal_satisfied = self._surface_push_goal_satisfied(instance, snapshot) if observable else None
-            add("capability_goal_satisfied", goal_satisfied, source="rgbd_relation")
-        if contract in ("gripper_open_v1", "push_effector_ready_v1", "release_candidate_v1", "grasp_candidate_v1"):
+            add("capability_goal_satisfied", goal_satisfied, source=goal_source)
+        if contract in ("gripper_open_v1", "push_effector_ready_v1", "release_candidate_v1", "grasp_candidate_v1", "tool_transfer_clearance_v1", "released_goal_observation_v1"):
             gripper = snapshot.robot.gripper
             add("gripper_position_m", gripper.opening_m, "m", "robot_feedback")
             add("gripper_commanded_position_m", gripper.target_opening_m, "m", "command")
+        if contract in ("tool_transfer_clearance_v1", "released_goal_observation_v1"):
+            geometry = tool_transfer_clearance_v1(snapshot)
+            clearance = None if geometry is None else geometry.clearance_m
+            required = self._config.placement_obstacle_clearance_m
+            add("gripper_open_observed", abs(snapshot.robot.gripper.opening_m - self._config.gripper_opening_m)
+                <= self._config.gripper_tolerance_m, source="robot_feedback")
+            add("tool_transfer_part_minimum_z_m", None if geometry is None else
+                tuple(z for _, z in geometry.part_minimum_z_m),
+                "m", "robot_feedback")
+            add("tool_transfer_reference_top_z_m", None if geometry is None else
+                tuple(z for _, z in geometry.reference_top_z_m),
+                "m", "rgbd_geometry")
+            add("tool_transfer_clearance_m", clearance, "m", "rgbd_robot_geometry")
+            add("tool_transfer_required_clearance_m", required, "m", "deployment_configuration")
+            add("tool_transfer_clearance_deficit_m", None if clearance is None else max(0.0, required - clearance),
+                "m", "rgbd_robot_geometry")
+        if contract == "released_goal_observation_v1":
+            observation = task_observation_geometry_v1(snapshot)
+            add("required_task_geometry_observed", observation.geometry_observed, source="rgbd_visibility_diagnostic")
+            add("task_observation_span_deficit_m", observation.span_deficit_m, "m", "rgbd_visibility_diagnostic")
+            add("task_observation_robot_occlusion_hint", observation.robot_occlusion_hint, source="rgbd_visibility_diagnostic")
         if contract == "tcp_subject_xy_aligned_v1":
             error = pick_xy_error_v1(snapshot, instance.subject_ref)
             add("tcp_to_subject_top_xy_m", None if error is None else
@@ -479,10 +536,18 @@ class RuntimeVerifierV1:
             add("tcp_to_subject_grasp_pose_m", correction, "m", "rgbd_robot_geometry")
             add("tcp_grasp_xy_error_m", None if correction is None else hypot(correction[0], correction[1]), "m", "rgbd_robot_geometry")
             add("tcp_grasp_height_band_error_m", None if correction is None else abs(correction[2]), "m", "rgbd_robot_geometry")
+            if snapshot.grasp_approach is not None:
+                from jev4mujoco.runtime.grasp_observation import (grasp_geometry_observed_v1,
+                    grasp_observation_motion_ready_v1, current_grasp_approach_v1)
+                approach = current_grasp_approach_v1(snapshot)
+                add("grasp_geometry_observed", grasp_geometry_observed_v1(snapshot), source="rgbd_geometry")
+                add("grasp_observation_span_deficit_m", None if approach is None else approach.current.span_deficit_m,
+                    "m", "rgbd_visibility_diagnostic")
+                add("grasp_observation_motion_ready", grasp_observation_motion_ready_v1(snapshot), source="rgbd_robot_geometry")
         if contract in ("grasp_probe_lifted_v1", "grasp_confirmed_v1"):
             add("grasp_probe_lifted", physical.evidence.grasp_probe_lifted, source="rgbd_robot_feedback")
             add("grasp_probe_failed", physical.evidence.grasp_probe_failed, source="rgbd_robot_feedback")
-        if contract == "transport_clearance_v1":
+        if contract in ("transport_clearance_v1", "release_candidate_v1"):
             geometry = self._transport_clearance_geometry(instance, snapshot)
             add("subject_bottom_clearance_m", None if geometry is None else geometry[0], "m", "rgbd_geometry")
             add("required_bottom_clearance_m", None if geometry is None else geometry[1], "m", "deployment_configuration")
@@ -509,16 +574,71 @@ class RuntimeVerifierV1:
                     for relation in snapshot.visual_scene.relations)
             add("placement_horizontal_relation_satisfied", self._transport_goal_satisfied(instance, snapshot) if observable else None,
                 source="rgbd_relation")
+            goal_parameters = {}
+            if instance.goal is not None:
+                for name in GOAL_DEFINITIONS_V1[instance.goal.predicate.value].parameter_refs:
+                    value = self._config
+                    for part in name.split("."):
+                        value = getattr(value, part)
+                    goal_parameters[name] = value
+            values.extend(placement_horizontal_measurements_v1(snapshot, goal_parameters,
+                evidence_current=self._phase_evidence_basis(snapshot).visual_evidence_current))
         if contract == "release_candidate_v1":
             bottom = self._bottom_z(snapshot, instance.subject_ref)
             height = self._placement_support_height(snapshot, instance)
-            add("subject_bottom_to_target_support_clearance_m", None if bottom is None or height is None else bottom - height,
+            clearance = None if bottom is None or height is None else bottom - height
+            add("subject_bottom_to_target_support_clearance_m", clearance,
                 "m", "rgbd_geometry")
+            maximum = self._config.release_maximum_bottom_clearance_m
+            add("placement_height_adjustment_maximum_clearance_m", maximum, "m", "deployment_configuration")
+            add("placement_height_adjustment_deficit_m", None if clearance is None else
+                max(0.0, -clearance, clearance - maximum), "m", "rgbd_geometry")
+            support_maximum = self._config.visual_relation_config.support_height_tolerance_m
+            add("placement_support_approach_maximum_clearance_m", support_maximum, "m", "deployment_configuration")
+            add("placement_support_approach_deficit_m", None if clearance is None else
+                max(0.0, -clearance, clearance - support_maximum), "m", "rgbd_geometry")
         if contract in ("push_precontact_aligned_v1", "push_contact_established_v1", "surface_push_goal_reached_v1", "push_effector_retracted_v1", "surface_push_goal_stable_v1"):
             geometry = self._surface_push_geometry(instance, snapshot)
             add("tcp_outside_subject_footprint_clearance_m", None if geometry is None else geometry[0], "m", "rgbd_robot_geometry")
             add("tcp_to_push_height_z_m", None if geometry is None else geometry[1]
                 + self._config.surface_push_tcp_height_above_surface_m - snapshot.robot.tcp_position_robot_base_m[2], "m", "rgbd_robot_geometry")
+        if contract in ("push_precontact_aligned_v1", "push_contact_established_v1", "surface_push_goal_reached_v1"):
+            from jev4mujoco.runtime.push_interaction import push_goal_geometry_v1
+            goal_geometry = push_goal_geometry_v1(snapshot, evidence_current=snapshot.freshness.visual_is_fresh,
+                parameters={"surface_push_clear_of_region_margin_m": self._config.surface_push_clear_of_region_margin_m})
+            for name, unit in (("vertex_signed_boundary_distances_m", "m"),
+                ("vertex_outside_distances_m", "m"), ("footprint_clearance_m", "m"), ("footprints_overlap", "boolean")):
+                if name in goal_geometry:
+                    add("push_" + name, goal_geometry[name], unit, "rgbd_geometry")
+            gripper = snapshot.robot.gripper
+            closed = self._config.surface_push_closed_gripper_position_m
+            tolerance = self._config.surface_push_gripper_position_tolerance_m
+            add("push_tool_closed_observed", None if gripper.right_joint_position_m is None else
+                all(abs(value - target) <= tolerance for value, target in (
+                    (gripper.opening_m, closed), (gripper.target_opening_m, closed),
+                    (gripper.right_joint_position_m, -closed))), source="robot_feedback")
+            height_error = None if geometry is None else geometry[1] + self._config.surface_push_tcp_height_above_surface_m - snapshot.robot.tcp_position_robot_base_m[2]
+            add("push_height_ready", None if height_error is None else
+                abs(height_error) <= self._config.surface_push_tcp_height_tolerance_m, source="rgbd_robot_geometry")
+            add("push_height_deficit_m", None if height_error is None else
+                max(0.0, abs(height_error) - self._config.surface_push_tcp_height_tolerance_m), "m", "rgbd_robot_geometry")
+            add("push_height_tolerance_m", self._config.surface_push_tcp_height_tolerance_m, "m", "deployment_configuration")
+            reposition_delta = None if geometry is None else geometry[1] + self._config.surface_push_reposition_height_above_surface_m - snapshot.robot.tcp_position_robot_base_m[2]
+            entity = self._entity(snapshot, instance.subject_ref)
+            center = None if entity is None or entity.visibility is not Visibility.CLEAR else entity.geometry.centroid_robot_base_m.value
+            extent = None if entity is None or entity.visibility is not Visibility.CLEAR else entity.geometry.extent_m.value
+            tool = snapshot.robot.tool_geometry
+            tool_clearance = None if tool is None or center is None or extent is None else min(
+                vertex[2] for part in tool.parts for vertex in part.vertices_robot_base_m) - (center[2] + extent[2] / 2)
+            add("tcp_to_push_reposition_height_z_m", reposition_delta, "m", "rgbd_robot_geometry")
+            add("push_reposition_height_deficit_m", None if reposition_delta is None else
+                max(0.0, abs(reposition_delta) - self._config.surface_push_tcp_height_tolerance_m), "m", "rgbd_robot_geometry")
+            add("push_tool_above_subject_clearance_m", tool_clearance, "m", "rgbd_robot_geometry")
+            add("push_reposition_ready", None if reposition_delta is None or tool_clearance is None or contact.mode is EffectorContactMode.UNKNOWN else
+                abs(reposition_delta) <= self._config.surface_push_tcp_height_tolerance_m
+                and tool_clearance > 0.0 and contact.mode is EffectorContactMode.CLEAR, source="rgbd_robot_geometry")
+            add("push_precontact_clearance_m", self._config.surface_push_precontact_clearance_m, "m", "deployment_configuration")
+            add("push_precontact_xy_tolerance_m", self._config.surface_push_precontact_xy_tolerance_m, "m", "deployment_configuration")
         if contract in ("press_point_aligned_v1", "button_pressed_v1"):
             region = self._region(snapshot, instance.target_ref)
             point = None if region is None or region.geometry.point_robot_base_m is None else region.geometry.point_robot_base_m.value
@@ -526,6 +646,12 @@ class RuntimeVerifierV1:
             delta = None if point is None else (point[0] - tcp[0], point[1] - tcp[1], 0.0)
             add("tcp_to_press_point_xy_m", delta, "m", "rgbd_robot_geometry")
             add("tcp_press_point_xy_error_m", self._press_point_xy_error(instance, snapshot), "m", "rgbd_robot_geometry")
+            if contract == "button_pressed_v1":
+                from jev4mujoco.runtime.press_event import press_event_observed_v1
+                add("press_event_observed", press_event_observed_v1(snapshot, instance.subject_ref, instance.target_ref),
+                    source="runtime_press_event_history")
+                add("press_current_button_displacement_m", None if snapshot.press_event is None else
+                    snapshot.press_event.current_button_displacement_m, "m", "rgbd_robot_geometry")
         return tuple(values)
 
     def _press_point_xy_error(
@@ -561,21 +687,14 @@ class RuntimeVerifierV1:
     def _verify_button_pressed_v1(
         self, instance: CapabilityInstanceV1, snapshot: StateSnapshotV2
     ) -> VerificationResultV1:
-        contact = snapshot.physical.effector_contact
-        xy_error = self._press_point_xy_error(instance, snapshot)
-        passed = (
-            self._goal_satisfied(instance, snapshot)
-            and contact.mode is EffectorContactMode.PUSH_CONTACT
-            and contact.subject_ref == instance.subject_ref
-            and xy_error is not None
-            and xy_error <= self._config.press_point_xy_tolerance_m
-        )
+        from jev4mujoco.runtime.press_event import press_event_observed_v1
+        observed = press_event_observed_v1(snapshot, instance.subject_ref, instance.target_ref)
         return self._boolean(
             "button_pressed_v1",
             snapshot,
-            passed,
-            "button travel, effector contact and press-point alignment are confirmed",
-            "button travel, contact or press-point alignment is not confirmed",
+            observed is True,
+            "fresh visual executed button press event was confirmed",
+            "button press event is not yet confirmed by comparable visual action response",
         )
     def _verify_tcp_subject_xy_aligned_v1(
         self, instance: CapabilityInstanceV1, snapshot: StateSnapshotV2
@@ -664,7 +783,7 @@ class RuntimeVerifierV1:
     ) -> VerificationResultV1:
         if not self._is_held(instance, snapshot):
             return self._failed(
-                "transport_clearance_v1", snapshot, "subject was lost during transport"
+                "transport_clearance_v1", snapshot, self._transport_hold_failure_reason(instance, snapshot)
             )
         geometry = self._transport_clearance_geometry(instance, snapshot)
         if geometry is None:
@@ -725,7 +844,7 @@ class RuntimeVerifierV1:
             return self._failed(
                 "held_subject_above_region_v1",
                 snapshot,
-                "subject was lost during transport",
+                self._transport_hold_failure_reason(instance, snapshot),
             )
         return self._boolean(
             "held_subject_above_region_v1",
@@ -740,7 +859,7 @@ class RuntimeVerifierV1:
     ) -> VerificationResultV1:
         if not self._is_held(instance, snapshot):
             return self._failed(
-                "transport_confirmed_v1", snapshot, "subject was lost during transport"
+                "transport_confirmed_v1", snapshot, self._transport_hold_failure_reason(instance, snapshot)
             )
         passed = (
             self._transport_goal_satisfied(instance, snapshot)
@@ -771,6 +890,34 @@ class RuntimeVerifierV1:
             "gripper is open and subject is no longer held",
             "release has not been physically observed",
         )
+
+    def _verify_tool_transfer_clearance_v1(
+        self, instance: CapabilityInstanceV1, snapshot: StateSnapshotV2
+    ) -> VerificationResultV1:
+        contract = "tool_transfer_clearance_v1"
+        measurements = {item.name: item for item in self._phase_measurements(instance, snapshot, contract)}
+        basis = self._phase_evidence_basis(snapshot)
+        targets = {name: getattr(self._config, name) for name in PHASE_DEFINITIONS_V1[contract].parameter_refs}
+        conditions = tuple(self._condition_feedback(spec, measurements, targets, snapshot, basis)
+            for spec in PHASE_CONDITION_SPECS_V1[contract])
+        missing = ", ".join(item.measurement for item in conditions if item.satisfied is not True)
+        return self._boolean(contract, snapshot, not missing,
+            "released finger tool reached current transfer clearance; final stability is not yet verified",
+            "tool exit requires current evidence: " + missing)
+
+    def _verify_released_goal_observation_v1(
+        self, instance: CapabilityInstanceV1, snapshot: StateSnapshotV2
+    ) -> VerificationResultV1:
+        contract = "released_goal_observation_v1"
+        measurements = {item.name: item for item in self._phase_measurements(instance, snapshot, contract)}
+        basis = self._phase_evidence_basis(snapshot)
+        targets = {name: getattr(self._config, name) for name in PHASE_DEFINITIONS_V1[contract].parameter_refs}
+        conditions = tuple(self._condition_feedback(spec, measurements, targets, snapshot, basis)
+            for spec in PHASE_CONDITION_SPECS_V1[contract])
+        missing = ", ".join(item.measurement for item in conditions if item.satisfied is not True)
+        return self._boolean(contract, snapshot, not missing,
+            "task geometry is currently observable; original final stability still requires verification",
+            "released task observation requires current evidence: " + missing)
 
     def _verify_push_effector_ready_v1(
         self, instance: CapabilityInstanceV1, snapshot: StateSnapshotV2
@@ -1143,6 +1290,26 @@ class RuntimeVerifierV1:
             or RuntimeVerifierV1._is_held(instance, snapshot))
 
     @staticmethod
+    def _transport_hold_failure_reason(instance, snapshot) -> str:
+        state = snapshot.physical.grasp_state
+        if state is GraspState.HELD:
+            return "transport holding estimate is bound to a different subject"
+        if state is GraspState.UNKNOWN:
+            return "transport holding evidence is unknown"
+        if state is GraspState.NOT_HELD:
+            return "transport estimator reports subject is not held"
+        diagnostic = snapshot.physical.evidence.grasp_diagnostic
+        reason = "holding confirmation is unavailable"
+        if diagnostic is not None and (
+            diagnostic.subject_ref == instance.subject_ref
+            and diagnostic.based_on_state_id == snapshot.state_id
+            and diagnostic.based_on_action_epoch == snapshot.action_epoch
+            and diagnostic.based_on_observation_id == snapshot.visual_scene.observation_id
+            and diagnostic.timestamp_s == snapshot.timestamp_s):
+            reason = diagnostic.reason
+        return f"transport holding is no longer confirmed: {reason}; physical dropping is not established"
+
+    @staticmethod
     def _is_held(
         instance: CapabilityInstanceV1, snapshot: StateSnapshotV2
     ) -> bool:
@@ -1157,6 +1324,9 @@ class RuntimeVerifierV1:
     ) -> bool:
         if instance.goal is None:
             return False
+        if instance.goal.predicate is VisualPredicate.PRESSED:
+            from jev4mujoco.runtime.press_event import press_event_observed_v1
+            return press_event_observed_v1(snapshot, instance.subject_ref, instance.goal.reference_ref) is instance.goal.desired_value
         return any(
             relation.predicate is instance.goal.predicate
             and relation.subject_ref == instance.subject_ref

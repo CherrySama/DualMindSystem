@@ -187,7 +187,7 @@ def main() -> None:
             )
             outcome = runtime.run(maximum_decisions=maximum_decisions, maximum_retries=args.maximum_retries)
             write_json(output_directory / "capability_program.json", runtime.program)
-            if outcome.overall_success:
+            if outcome.overall_success and not outcome.execution_anomalies:
                 runtime.record_idle_tail(args.success_tail_seconds)
         except Exception as error:
             failure = {
@@ -245,6 +245,11 @@ def main() -> None:
         "runtime_verifier_success": outcome.runtime_verifier_success,
         "hidden_ground_truth": outcome.hidden_ground_truth,
         "overall_success": outcome.overall_success,
+        "task_achieved": outcome.hidden_ground_truth.success,
+        "online_goal_status": "confirmed" if outcome.runtime_verifier_success else "unconfirmed",
+        "execution_anomalies": outcome.execution_anomalies,
+        "execution_stop_reason": outcome.execution_stop_reason,
+        "autonomous_success": outcome.autonomous_success,
         "video_path": str(final_video_path),
         "video_fps": video_fps,
         "success_tail_seconds": args.success_tail_seconds,

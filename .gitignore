@@ -11,6 +11,8 @@ __pycache__/
 # MuJoCo runtime logs and local experiment outputs
 MUJOCO_LOG.TXT
 runs/
+tests/
+docs/
 
 # Downloaded RoboTwin object assets and temporary archive
 assets/objects/

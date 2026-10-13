@@ -19,12 +19,12 @@ from jev4mujoco.planning.presets import (
     build_preset_place_then_push_plan_v1,
     build_preset_press_button_plan_v1,
     build_preset_relative_placement_plan_v1,
-    build_preset_row_arrangement_plan_v1,
+    build_preset_color_slot_arrangement_plan_v1,
     build_preset_stack_plan_v1,
     build_preset_push_aside_plan_v1,
     build_preset_push_to_region_plan_v1,
 )
-from jev4mujoco.contracts.state_snapshot import StateSnapshotV2
+from jev4mujoco.contracts.state_snapshot import StateSnapshotV2, GraspState
 from jev4mujoco.perception.surface_geometry import polygon_clearance_v1
 from jev4mujoco.contracts.task_plan import TaskPlanV1
 from jev4mujoco.contracts.visual_scene import VisualPredicate, VisualSceneV1
@@ -283,7 +283,7 @@ class RelativePlacementRuntimeV1(BlockPickPlaceRuntimeV1):
 
 
 class MultiBlockArrangeRuntimeV1(BlockPickPlaceRuntimeV1):
-    """Arrange the initially bound blocks into a coarse, collision-free row."""
+    """Place initially color-bound blocks on their prescribed row slots."""
 
     def __init__(
         self,
@@ -293,18 +293,13 @@ class MultiBlockArrangeRuntimeV1(BlockPickPlaceRuntimeV1):
         video_fps: float = 20.0,
         event_sink: RuntimeEventSink | None = None,
     ) -> None:
-        self._arrangement_destinations = {
-            "block_1": "storage_region",
-            "block_2": "storage_region",
-            "block_3": "storage_region",
-        }
-
         def build_plan(scene: VisualSceneV1) -> TaskPlanV1:
-            return build_preset_row_arrangement_plan_v1(
-                task_id="three_block_row_arrangement_001",
-                instruction="把三个方块粗略排成一行并分开放置",
+            return build_preset_color_slot_arrangement_plan_v1(
+                task_id="three_block_color_slot_arrangement_001",
+                instruction="从固定相机画面左到右，把红、黄、蓝方块分别放到三个同色圆垫上",
                 initial_scene=scene,
-                subject_refs=("block_1", "block_2", "block_3"),
+                color_order=("red", "yellow", "blue"),
+                ordered_slot_refs=("pad_slot_1", "pad_slot_2", "pad_slot_3"),
                 workspace_ref="storage_region",
             )
 
@@ -318,12 +313,32 @@ class MultiBlockArrangeRuntimeV1(BlockPickPlaceRuntimeV1):
             task_plan_builder=build_plan,
             episode_scene_id="three_block_row_arrangement_episode_001",
         )
+        self._arrangement_destinations = {item.subject_ref: item.destination.region_ref
+                                         for item in self.task_plan.task.slot_assignments}
+        self._arrangement_support_geoms = {ref: f"{ref}_collision"
+                                          for ref in self._arrangement_destinations.values()}
+        regions = {r.region_id: r for r in self._visual_config.calibrated_regions}
+        centers = [np.mean(regions[ref].boundary_xy_robot_base_m, axis=0)
+                   for ref in self._arrangement_destinations.values()]
+        direction = centers[-1] - centers[0]
+        length = float(np.linalg.norm(direction))
+        if length <= 1e-9:
+            raise ValueError("arrangement row requires distinct endpoint slots")
+        self._arrangement_cross_axis = (-float(direction[1]) / length, float(direction[0]) / length)
+        self._record("arrangement_goal_layout", {
+            "assignments": self.task_plan.task.slot_assignments,
+            "row_cross_axis_robot_base": self._arrangement_cross_axis,
+        })
 
     def _runtime_task_completion(
         self, final_state: StateSnapshotV2
     ) -> tuple[bool, str]:
         subject_refs = tuple(self._arrangement_destinations)
         scene = final_state.visual_scene
+        passed, reason = self._verifier.verify_final_region_goals(
+            final_state, tuple(self._arrangement_destinations.items()))
+        if not passed:
+            return False, reason
         entities = {
             entity.track_id: entity
             for entity in scene.entities
@@ -331,17 +346,9 @@ class MultiBlockArrangeRuntimeV1(BlockPickPlaceRuntimeV1):
         }
         if set(entities) != set(subject_refs):
             return False, "arrangement subjects are not all visible"
-        if not all(
-            any(
-                relation.predicate is VisualPredicate.IN_REGION
-                and relation.subject_ref == subject_ref
-                and relation.reference_ref == "storage_region"
-                and relation.value
-                for relation in scene.relations
-            )
-            for subject_ref in subject_refs
-        ):
-            return False, "not all arrangement subjects are inside the workspace"
+        if any(entities[ref].support_region_ref != target
+               for ref, target in self._arrangement_destinations.items()):
+            return False, "current visual support does not match each assigned pad"
         centroids = [
             entities[subject_ref].geometry.centroid_robot_base_m.value
             for subject_ref in subject_refs
@@ -352,9 +359,9 @@ class MultiBlockArrangeRuntimeV1(BlockPickPlaceRuntimeV1):
         ]
         if any(value is None for value in centroids + footprints):
             return False, "arrangement geometry is unobservable"
-        row_cross_span = max(value[1] for value in centroids) - min(
-            value[1] for value in centroids
-        )
+        row_projection = [sum(value[i] * self._arrangement_cross_axis[i] for i in (0, 1))
+                          for value in centroids]
+        row_cross_span = max(row_projection) - min(row_projection)
         minimum_clearance = min(
             polygon_clearance_v1(footprints[index], footprints[other])
             for index in range(len(footprints))
@@ -366,15 +373,57 @@ class MultiBlockArrangeRuntimeV1(BlockPickPlaceRuntimeV1):
             and minimum_clearance
             >= self._verifier_config.arrangement_minimum_pairwise_clearance_m
         )
+        if passed:
+            return self._arrangement_layout_stable(final_state)
         return (
-            passed,
-            "arrangement row relation passed"
-            if passed
-            else (
+            False,
+            (
                 f"arrangement row span={row_cross_span:.6f} m, "
                 f"clearance={minimum_clearance:.6f} m"
             ),
         )
+
+    def _arrangement_layout_stable(self, final_state: StateSnapshotV2) -> tuple[bool, str]:
+        """Recheck all subjects over recorded fresh frames, using original stability limits."""
+        config = self._verifier_config
+        goals = tuple(self._arrangement_destinations.items())
+        scope = (final_state.visual_scene.scene_id, final_state.visual_scene.sensor)
+        seen = set()
+        samples = []
+        snapshots = [final_state, *(event.payload for event in reversed(self._events)
+                                   if event.kind == "state_snapshot")]
+        for state in snapshots:
+            scene = state.visual_scene
+            identity = (scene.scene_id, scene.observation_id)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            if (scene.scene_id, scene.sensor) != scope:
+                break
+            valid, _ = self._verifier.verify_final_region_goals(state, goals)
+            entities = {e.track_id: e for e in scene.entities}
+            gripper = state.robot.gripper
+            if (not valid or state.physical.grasp_state is not GraspState.NOT_HELD
+                or abs(gripper.opening_m - config.gripper_opening_m) > config.gripper_tolerance_m
+                or any(entities[ref].support_region_ref != target
+                       or entities[ref].geometry.centroid_robot_base_m.value is None
+                       or entities[ref].geometry.extent_m.value is None
+                       for ref, target in goals)):
+                break
+            centers = np.asarray([entities[ref].geometry.centroid_robot_base_m.value for ref, _ in goals])
+            timestamp = scene.capture_timestamp_s
+            if samples:
+                previous_time, previous_centers = samples[-1]
+                if timestamp >= previous_time:
+                    break
+                if np.max(np.linalg.norm(centers - previous_centers, axis=1)) > config.placement_maximum_centroid_shift_m:
+                    break
+                if previous_time - timestamp + 1e-12 < config.placement_minimum_observation_interval_s:
+                    continue
+            samples.append((timestamp, centers))
+            if len(samples) >= config.placement_required_consecutive_observations:
+                return True, "all assigned color slots are currently supported and visually stable"
+        return False, f"assigned layout stability has {len(samples)}/{config.placement_required_consecutive_observations} fresh observations"
 
     def _hidden_truth(self, raw: RawStateSnapshot) -> ArrangementHiddenTruthResultV1:
         return evaluate_arrangement(self, raw)
@@ -542,6 +591,13 @@ class LargeButtonPressRuntimeV1(BlockPickPlaceRuntimeV1):
         initial = self.backend.snapshot()
         self._initial_button_center_xy = initial.bowl_position_robot_base_m[:2]
         self._initial_button_center_z = initial.bowl_position_robot_base_m[2]
+        from jev4mujoco.experiments.press_judge import ButtonPressTrajectoryJudgeV1
+        point = next(r for r in self._last_visual_scene.regions if r.region_id == "button_1_press_point")
+        self._button_press_judge = ButtonPressTrajectoryJudgeV1(
+            point.geometry.surface_normal_robot_base.value,
+            self._verifier_config.press_visual_confirmation_margin_m)
+        self._button_press_judge.capture(initial)
+        self.backend.install_evaluation_observer(self._button_press_judge.capture)
 
     def _hidden_truth(self, raw: RawStateSnapshot) -> ButtonPressHiddenTruthResultV1:
         return evaluate_button_press(self, raw)

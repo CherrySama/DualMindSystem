@@ -50,6 +50,7 @@ class ArrangementPattern(str, Enum):
 
 class ArrangementOrdering(str, Enum):
     ANY = "any"
+    ASSIGNED_SLOTS = "assigned_slots"
 
 
 class ExpansionPolicy(str, Enum):
@@ -288,12 +289,26 @@ class PushAsideTaskV1:
 
 
 @dataclass(frozen=True, slots=True)
+class ArrangementSlotAssignmentV1:
+    """One bound object and its destination, with no action or trajectory."""
+
+    subject_ref: str
+    destination: RegionRefV1
+
+    def __post_init__(self) -> None:
+        _identifier(self.subject_ref, "arrangement subject_ref")
+        if self.destination.expected_region_type is not RegionType.REGION_2D:
+            raise ValueError("arrangement slot must be region_2d")
+
+
+@dataclass(frozen=True, slots=True)
 class ArrangeObjectsTaskV1:
     subjects: EntitySetV1
     workspace: RegionRefV1
     pattern: ArrangementPattern
     ordering: ArrangementOrdering = ArrangementOrdering.ANY
     population_basis: PopulationBasis = PopulationBasis.INITIAL_SCENE
+    slot_assignments: tuple[ArrangementSlotAssignmentV1, ...] = ()
     kind: TaskKind = field(default=TaskKind.ARRANGE_OBJECTS, init=False)
 
     def __post_init__(self) -> None:
@@ -301,6 +316,19 @@ class ArrangeObjectsTaskV1:
             raise ValueError("arrange_objects subjects must use all_matching")
         if self.workspace.expected_region_type is not RegionType.REGION_2D:
             raise ValueError("arrangement workspace must be region_2d")
+        if self.ordering is ArrangementOrdering.ANY:
+            if self.slot_assignments:
+                raise ValueError("any-order arrangement cannot carry assigned slots")
+        elif self.ordering is ArrangementOrdering.ASSIGNED_SLOTS:
+            subjects = tuple(item.subject_ref for item in self.slot_assignments)
+            slots = tuple(item.destination.region_ref for item in self.slot_assignments)
+            if (len(subjects) < 2 or len(subjects) != len(set(subjects))
+                or set(subjects) != set(self.subjects.initial_binding.track_ids)):
+                raise ValueError("slot assignments must cover each bound subject exactly once")
+            if len(slots) != len(set(slots)):
+                raise ValueError("arrangement slots must be unique")
+        else:
+            raise ValueError("unsupported arrangement ordering")
 
 
 @dataclass(frozen=True, slots=True)
@@ -590,7 +618,7 @@ def _region_refs(task: TaskSpecV1) -> tuple[RegionRefV1, ...]:
     if isinstance(task, PushAsideTaskV1):
         return (task.protected_region,)
     if isinstance(task, ArrangeObjectsTaskV1):
-        return (task.workspace,)
+        return (task.workspace, *(item.destination for item in task.slot_assignments))
     if isinstance(task, StackObjectsTaskV1):
         return (task.stacking_region,)
     if isinstance(task, PressButtonTaskV1):

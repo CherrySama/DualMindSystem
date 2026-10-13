@@ -198,14 +198,33 @@ CAPABILITY_TEMPLATES_V1: dict[CapabilityKind, CapabilityTemplateV1] = {
         phases=(
             CapabilityPhaseTemplateV1(
                 phase_id="lower_to_release",
-                allowed_intents=("lower_to_release", "release_subject"),
+                allowed_intents=("lower_to_release", "approach_placement_support", "release_subject", "restore_placement_clearance",
+                    "restore_placement_relation", "observe_placement_evidence"),
                 allowed_actions=(
                     AtomicAction.DOWN,
                     AtomicAction.UP,
                     AtomicAction.HOLD,
                     AtomicAction.GRIPPER_OPEN,
+                    AtomicAction.FORWARD,
+                    AtomicAction.BACKWARD,
+                    AtomicAction.LEFT,
+                    AtomicAction.RIGHT,
                 ),
                 completion_contract="release_candidate_v1",
+                requires_fresh_visual=True,
+            ),
+            CapabilityPhaseTemplateV1(
+                phase_id="retract_after_release",
+                allowed_intents=("retract_after_release",),
+                allowed_actions=(AtomicAction.UP, AtomicAction.HOLD),
+                completion_contract="tool_transfer_clearance_v1",
+                requires_fresh_visual=True,
+            ),
+            CapabilityPhaseTemplateV1(
+                phase_id="observe_task_geometry",
+                allowed_intents=("observe_task_geometry",),
+                allowed_actions=(AtomicAction.UP, AtomicAction.HOLD),
+                completion_contract="released_goal_observation_v1",
                 requires_fresh_visual=True,
             ),
             CapabilityPhaseTemplateV1(

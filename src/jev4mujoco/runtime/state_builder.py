@@ -11,7 +11,11 @@ from jev4mujoco.planning.capabilities import (
     CapabilityRunStatus,
 )
 from jev4mujoco.runtime.transitions import active_skill_state_v2
-from jev4mujoco.contracts.actions import ActionResult, RawStateSnapshot
+from jev4mujoco.contracts.actions import ActionResult
+from jev4mujoco.contracts.robot_feedback import RobotFeedbackV1
+from jev4mujoco.runtime.interaction_estimator import (
+    InteractionEstimatorConfigV1, VisualInteractionEstimatorV1, visual_support_estimate_v1,
+)
 from jev4mujoco.runtime.grasp_geometry import grasp_height_band_from_geometry_v1
 from jev4mujoco.contracts.state_snapshot import (
     ActionFeedbackV1,
@@ -21,6 +25,7 @@ from jev4mujoco.contracts.state_snapshot import (
     EffectorObjectContactV2,
     FreshnessStateV2,
     GraspState,
+    GraspDiagnosticV1,
     GripperMotionState,
     GripperStateV2,
     InteractionStateV2,
@@ -41,9 +46,7 @@ from jev4mujoco.contracts.state_snapshot import (
 from jev4mujoco.contracts.task_plan import TASK_REGISTRY_VERSION, TaskPlanV1
 from jev4mujoco.contracts.visual_scene import (
     EntityV1,
-    RegionType,
     RegionV1,
-    VisualPredicate,
     VisualSceneV1,
     Visibility,
 )
@@ -78,15 +81,23 @@ class LiveStateConfigV2:
     grasp_probe_stable_hold_s: float = 0.15
     grasp_probe_maximum_relative_error_m: float = 0.006
     grasp_maximum_relative_drift_m: float = 0.018
+    maximum_visual_age_s: float = 0.5
+    support_height_tolerance_m: float = 0.01
+    contact_geometry_gap_tolerance_m: float = 0.002
+    minimum_interaction_motion_m: float = 0.0005
 
 
 class LiveStateSnapshotBuilderV2:
-    """Fuses public RGB-D geometry with robot/contact feedback into StateSnapshotV2."""
+    """融合公开 RGB-D 与机器人反馈；不接收仿真物体/接触快照。"""
 
     def __init__(self, config: LiveStateConfigV2, tool_calibration=None) -> None:
         self._config = config
         self._tool_calibration = tool_calibration
+        self._interaction_estimator = VisualInteractionEstimatorV1(InteractionEstimatorConfigV1(
+            config.contact_geometry_gap_tolerance_m, config.minimum_interaction_motion_m,
+            config.grasp_probe_maximum_relative_error_m, config.maximum_visual_age_s))
         self._previous_subject_ref: str | None = None
+        self._last_grasp_observation = None
         self._visual_follow_confirmed = False
         self._candidate_tcp: Vec3 | None = None
         self._candidate_centroid: Vec3 | None = None
@@ -94,11 +105,12 @@ class LiveStateSnapshotBuilderV2:
         self._probe_relative: Vec3 | None = None
         self._grasp_confirmed = False
         self._grasp_probe_failed = False
+        self._grasp_diagnostic_reason = "contact_candidate_absent"
 
     def build(
         self,
         *,
-        raw: RawStateSnapshot,
+        robot_feedback: RobotFeedbackV1,
         visual_scene: VisualSceneV1,
         task_plan: TaskPlanV1,
         program: CapabilityProgramV1,
@@ -106,6 +118,9 @@ class LiveStateSnapshotBuilderV2:
         recent_action: ActionResult | None = None,
         decision_feedback: DecisionFeedbackV1 | None = None,
     ) -> StateSnapshotV2:
+        if not isinstance(robot_feedback, RobotFeedbackV1):
+            raise TypeError("state builder only accepts whitelisted robot feedback")
+        raw = robot_feedback
         instance = self._current_instance(program, execution)
         if instance.subject_ref != self._previous_subject_ref:
             self._previous_subject_ref = instance.subject_ref
@@ -114,10 +129,15 @@ class LiveStateSnapshotBuilderV2:
         centroid = subject.geometry.centroid_robot_base_m.value
         extent = subject.geometry.extent_m.value
         tcp = raw.tcp_position_robot_base_m
-        both_contacts = (
-            raw.contacts.left_finger_bowl_contact
-            and raw.contacts.right_finger_bowl_contact
-        )
+        action_end = 0.0 if recent_action is None else recent_action.end_simulation_time_s
+        current_visual = (0 <= raw.timestamp_s - visual_scene.capture_timestamp_s <= self._config.maximum_visual_age_s
+            and visual_scene.capture_timestamp_s >= action_end)
+        geometry_current = current_visual and subject.visibility is Visibility.CLEAR and centroid is not None and extent is not None
+        tool = (self._tool_calibration.observe(tcp, raw.tcp_orientation_robot_base_wxyz,
+            raw.gripper_joint_m, raw.right_gripper_joint_m) if self._tool_calibration is not None else None)
+        interaction_estimate = self._interaction_estimator.observe(raw, visual_scene, subject, tool, recent_action)
+        supported, visual_support_ref = visual_support_estimate_v1(visual_scene, subject,
+            current=current_visual, height_tolerance_m=self._config.support_height_tolerance_m)
         gripper_commanded_closed = (
             abs(raw.gripper_target_m - self._config.gripper_closed_joint_m)
             <= self._config.gripper_position_tolerance_m
@@ -125,73 +145,40 @@ class LiveStateSnapshotBuilderV2:
         gripper_blocked = (
             raw.gripper_joint_m >= self._config.minimum_blocked_gripper_joint_m
         )
-        press_mode = instance.kind is CapabilityKind.PRESS
         push_mode = instance.kind in (CapabilityKind.SURFACE_PUSH, CapabilityKind.PRESS)
-        grasp_contact_candidate = (
-            both_contacts
-            and gripper_commanded_closed
-            and gripper_blocked
-        )
-        self._update_grasp_probe(
-            centroid, tcp, raw.simulation_time_s, grasp_contact_candidate,
-            None if extent is None else extent[2],
-            instance.kind is CapabilityKind.PLACE and raw.contacts.bowl_table_contact,
-        )
+        band = None if not geometry_current else grasp_height_band_from_geometry_v1(centroid, extent)
+        aligned = (band is not None and hypot(centroid[0] - tcp[0], centroid[1] - tcp[1]) <= self._config.grasp_xy_tolerance_m
+            and band[0] <= tcp[2] <= band[1])
+        grasp_contact_candidate = gripper_commanded_closed and gripper_blocked and geometry_current and (
+            aligned or self._candidate_tcp is not None)
+        # 遮挡只使当前证据未知，保留历史锚点以便下一帧重新核验；不沿用历史持有许可。
+        observation_key = (visual_scene.scene_id, visual_scene.observation_id, instance.subject_ref)
+        if not (gripper_commanded_closed and gripper_blocked):
+            self._reset_grasp_probe()
+        elif geometry_current and observation_key != self._last_grasp_observation:
+            self._update_grasp_probe(centroid if geometry_current else None, tcp, raw.simulation_time_s,
+                grasp_contact_candidate, None if extent is None else extent[2],
+                instance.kind is CapabilityKind.PLACE and supported is True)
+            self._last_grasp_observation = observation_key
+        elif not geometry_current:
+            self._grasp_diagnostic_reason = "subject_geometry_unobservable"
 
         if grasp_contact_candidate:
             grasp_state = GraspState.HELD if self._grasp_confirmed else GraspState.CANDIDATE_HELD
             held_object_ref = instance.subject_ref if self._grasp_confirmed else None
-            contact_mode = EffectorContactMode.GRASP_CONTACT
+            contact_mode = EffectorContactMode.GRASP_CONTACT if self._grasp_confirmed else EffectorContactMode.CONTACT_CANDIDATE
         else:
-            grasp_state = GraspState.NOT_HELD
+            grasp_state = (GraspState.UNKNOWN if gripper_commanded_closed and gripper_blocked
+                else GraspState.NOT_HELD)
             held_object_ref = None
             contact_mode = (
                 EffectorContactMode.PUSH_CONTACT
                 if push_mode
-                and (press_mode or raw.contacts.bowl_table_contact)
-                and (
-                    raw.contacts.left_finger_bowl_contact
-                    or raw.contacts.right_finger_bowl_contact
-                )
-                else EffectorContactMode.GRASP_CONTACT
-                if both_contacts
-                else EffectorContactMode.SINGLE_FINGER
-                if raw.contacts.left_finger_bowl_contact
-                or raw.contacts.right_finger_bowl_contact
-                else EffectorContactMode.CLEAR
+                and supported is True and interaction_estimate.status == "motion_supported"
+                else EffectorContactMode.CONTACT_CANDIDATE if interaction_estimate.status in ("candidate", "motion_supported")
+                else EffectorContactMode.CLEAR if interaction_estimate.status == "clear"
+                else EffectorContactMode.UNKNOWN
             )
-
-        entity_refs = {entity.track_id for entity in visual_scene.entities}
-        dynamic_support_ref = next(
-            (
-                relation.reference_ref
-                for relation in visual_scene.relations
-                if relation.predicate is VisualPredicate.ON_SURFACE
-                and relation.subject_ref == subject.track_id
-                and relation.reference_ref in entity_refs
-                and relation.value
-            ),
-            None,
-        )
-        if dynamic_support_ref is None:
-            volume_refs = {
-                region.region_id
-                for region in visual_scene.regions
-                if region.region_type is RegionType.VOLUME_3D
-            }
-            dynamic_support_ref = next(
-                (
-                    relation.reference_ref
-                    for relation in visual_scene.relations
-                    if relation.predicate is VisualPredicate.INSIDE
-                    and relation.subject_ref == subject.track_id
-                    and relation.reference_ref in volume_refs
-                    and relation.value
-                ),
-                None,
-            )
-        visual_support_ref = dynamic_support_ref or subject.support_region_ref
-        supported = raw.contacts.bowl_table_contact and visual_support_ref is not None
         skill = self._skill_state(program, execution)
         if (
             skill.skill_kind == "pick"
@@ -244,9 +231,7 @@ class LiveStateSnapshotBuilderV2:
                     right_joint_position_m=raw.right_gripper_joint_m,
                 ),
                 execution_state=RobotExecutionState.IDLE,
-                tool_geometry=(self._tool_calibration.observe(tcp,
-                    raw.tcp_orientation_robot_base_wxyz, raw.gripper_joint_m, raw.right_gripper_joint_m)
-                    if self._tool_calibration is not None and instance.kind is CapabilityKind.SURFACE_PUSH else None),
+                tool_geometry=tool,
             ),
             physical=PhysicalStateV2(
                 grasp_state=grasp_state,
@@ -254,16 +239,14 @@ class LiveStateSnapshotBuilderV2:
                 effector_contact=EffectorObjectContactV2(
                     subject_ref=(
                         instance.subject_ref
-                        if raw.contacts.left_finger_bowl_contact
-                        or raw.contacts.right_finger_bowl_contact
+                        if contact_mode in (EffectorContactMode.CONTACT_CANDIDATE,
+                            EffectorContactMode.GRASP_CONTACT, EffectorContactMode.PUSH_CONTACT)
                         else None
                     ),
                     mode=contact_mode,
-                    left_finger_contact=raw.contacts.left_finger_bowl_contact,
-                    right_finger_contact=raw.contacts.right_finger_bowl_contact,
-                    support_contact=(
-                        press_mode or raw.contacts.bowl_table_contact
-                    ),
+                    left_finger_contact=False if contact_mode is EffectorContactMode.CLEAR else None,
+                    right_finger_contact=False if contact_mode is EffectorContactMode.CLEAR else None,
+                    support_contact=supported,
                 ),
                 support_state=SupportStateV2(
                     subject_ref=instance.subject_ref,
@@ -276,9 +259,12 @@ class LiveStateSnapshotBuilderV2:
                     fresh_visual_required=True,
                     grasp_probe_lifted=self._probe_lifted_at_s is not None and grasp_contact_candidate,
                     grasp_probe_failed=self._grasp_probe_failed,
-                    contact_source="mujoco_contact_oracle",
-                    grasp_source="rgbd_robot_feedback_and_mujoco_contact",
-                    support_source="rgbd_geometry_and_mujoco_contact",
+                    contact_source="rgbd_robot_motion_estimate",
+                    grasp_source="rgbd_robot_gripper_and_follow_estimate",
+                    support_source="rgbd_geometry_support_estimate",
+                    grasp_diagnostic=self._grasp_diagnostic(
+                        instance.subject_ref, subject, tcp, raw, visual_scene.observation_id),
+                    interaction_estimate=interaction_estimate,
                 ),
             ),
             visual_scene=visual_scene,
@@ -297,7 +283,7 @@ class LiveStateSnapshotBuilderV2:
             ),
             freshness=FreshnessStateV2(
                 visual_age_s=visual_age,
-                visual_is_fresh=True,
+                visual_is_fresh=current_visual,
                 prediction_steps=0,
                 pending_contact_verification=skill.phase in ("close_gripper", "verify_grasp"),
                 pending_completion_verification=skill.status is SkillRunStatus.AWAITING_VERIFICATION,
@@ -314,10 +300,36 @@ class LiveStateSnapshotBuilderV2:
         self._grasp_confirmed = False
         self._grasp_probe_failed = False
         self._visual_follow_confirmed = False
+        self._grasp_diagnostic_reason = "contact_candidate_absent"
 
     def reset_for_retry(self) -> None:
         self._previous_subject_ref = None
         self._reset_grasp_probe()
+        self._last_grasp_observation = None
+        self._interaction_estimator.reset()
+
+    def _maximum_grasp_relative_drift(self, object_height_m: float | None) -> float:
+        maximum = self._config.grasp_maximum_relative_drift_m
+        return maximum if object_height_m is None else min(maximum, 0.6 * object_height_m)
+
+    def _grasp_diagnostic(self, subject_ref, subject, tcp, raw, observation_id):
+        centroid = subject.geometry.centroid_robot_base_m.value
+        extent = subject.geometry.extent_m.value
+        relative = None if centroid is None else _subtract(centroid, tcp)
+        drift = (None if relative is None or self._probe_relative is None else
+            _subtract(relative, self._probe_relative))
+        return GraspDiagnosticV1(
+            subject_ref, self._grasp_diagnostic_reason, raw.state_id, raw.action_epoch,
+            observation_id, raw.simulation_time_s, subject.visibility.value,
+            current_relative_robot_base_m=relative,
+            candidate_anchor_relative_robot_base_m=(None if self._candidate_centroid is None
+                or self._candidate_tcp is None else _subtract(self._candidate_centroid, self._candidate_tcp)),
+            probe_anchor_relative_robot_base_m=self._probe_relative,
+            relative_drift_robot_base_m=drift,
+            relative_drift_m=None if drift is None else _norm(drift),
+            maximum_relative_drift_m=self._maximum_grasp_relative_drift(
+                None if extent is None else extent[2]),
+        )
 
     def _update_grasp_probe(
         self, centroid: Vec3 | None, tcp: Vec3, timestamp_s: float,
@@ -326,14 +338,15 @@ class LiveStateSnapshotBuilderV2:
     ) -> None:
         if not grasp_contact_candidate or centroid is None:
             self._reset_grasp_probe()
+            if grasp_contact_candidate:
+                self._grasp_diagnostic_reason = "subject_geometry_unobservable"
             return
         relative = _subtract(centroid, tcp)
-        maximum_drift = self._config.grasp_maximum_relative_drift_m
-        if object_height_m is not None:
-            maximum_drift = min(maximum_drift, 0.6 * object_height_m)
+        maximum_drift = self._maximum_grasp_relative_drift(object_height_m)
         if self._candidate_tcp is None or self._candidate_centroid is None:
             self._candidate_tcp = tcp
             self._candidate_centroid = centroid
+            self._grasp_diagnostic_reason = "awaiting_coupled_lift"
             return
         candidate_relative = _subtract(self._candidate_centroid, self._candidate_tcp)
         tcp_lift = tcp[2] - self._candidate_tcp[2]
@@ -348,22 +361,28 @@ class LiveStateSnapshotBuilderV2:
                 self._probe_lifted_at_s = timestamp_s
                 self._probe_relative = relative
                 self._visual_follow_confirmed = True
+                self._grasp_diagnostic_reason = "awaiting_stable_following"
             elif tcp_lift >= self._config.grasp_probe_maximum_lift_m:
                 self._grasp_probe_failed = True
+                self._grasp_diagnostic_reason = "coupled_lift_not_confirmed"
             return
         if self._probe_relative is None:
             raise RuntimeError("lifted grasp probe has no relative-pose anchor")
         if not self._grasp_confirmed and _norm(_subtract(relative, self._probe_relative)) > self._config.grasp_probe_maximum_relative_error_m:
+            if not self._grasp_probe_failed:
+                self._grasp_diagnostic_reason = "probe_relative_drift_exceeded"
             self._grasp_probe_failed = True
         if self._grasp_confirmed and not placing_on_support and _norm(_subtract(relative, self._probe_relative)) > maximum_drift:
             self._grasp_confirmed = False
             self._visual_follow_confirmed = False
             self._grasp_probe_failed = True
+            self._grasp_diagnostic_reason = "held_relative_drift_exceeded"
             return
         if self._grasp_probe_failed:
             return
         if timestamp_s - self._probe_lifted_at_s >= self._config.grasp_probe_stable_hold_s:
             self._grasp_confirmed = True
+            self._grasp_diagnostic_reason = "held_confirmed"
 
     @staticmethod
     def _current_instance(program: CapabilityProgramV1, execution: CapabilityExecutionStateV1):

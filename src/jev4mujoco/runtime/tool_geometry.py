@@ -87,6 +87,60 @@ class CalibratedFingerToolV1:
         return ToolGeometryV1(tuple(parts))
 
 
+@dataclass(frozen=True, slots=True)
+class ToolTransferClearanceV1:
+    """当前夹指最低点至释放对象及目标参考的净空，不是整臂路径证明。"""
+    part_minimum_z_m: tuple[tuple[str, float], ...]
+    reference_top_z_m: tuple[tuple[str, float], ...]
+
+    @property
+    def clearance_m(self):
+        return min(z for _, z in self.part_minimum_z_m) - max(z for _, z in self.reference_top_z_m)
+
+
+def tool_transfer_clearance_v1(snapshot):
+    """Only current public geometry and measured independent finger joints are used."""
+    skill, tool = snapshot.skill, snapshot.robot.tool_geometry
+    action_end = 0.0 if snapshot.recent_action is None else snapshot.recent_action.end_timestamp_s
+    if (skill.skill_kind != "place" or skill.phase not in ("retract_after_release", "observe_task_geometry", "verify_placement")
+        or skill.goal is None or skill.goal.reference_ref != skill.target_ref
+        or tool is None or snapshot.robot.gripper.right_joint_position_m is None
+        or not snapshot.physical.evidence.robot_feedback_available
+        or not snapshot.freshness.visual_is_fresh
+        or snapshot.sources.robot_measurement_timestamp_s != snapshot.timestamp_s
+        or snapshot.sources.visual_capture_timestamp_s != snapshot.visual_scene.capture_timestamp_s
+        or min(snapshot.sources.robot_measurement_timestamp_s,
+            snapshot.visual_scene.capture_timestamp_s) < action_end):
+        return None
+    entities = {item.track_id: item for item in snapshot.visual_scene.entities}
+    references = {}
+
+    def entity_top(ref):
+        entity = entities.get(ref)
+        top = None if entity is None or entity.visibility is not Visibility.CLEAR else entity.geometry.top_center_robot_base_m.value
+        if top is None:
+            return False
+        references[ref] = float(top[2])
+        return True
+
+    if not entity_top(skill.subject_ref):
+        return None
+    target = next((item for item in snapshot.visual_scene.regions if item.region_id == skill.target_ref), None)
+    if target is not None:
+        height = target.geometry.surface_height_robot_base_m
+        if height is None or height.value is None:
+            return None
+        references[target.region_id] = float(height.value)
+        if target.owner_entity_ref is not None and not entity_top(target.owner_entity_ref):
+            return None
+    elif not entity_top(skill.target_ref):
+        return None
+    return ToolTransferClearanceV1(
+        tuple((part.part_id, float(min(v[2] for v in part.vertices_robot_base_m))) for part in tool.parts),
+        tuple(references.items()),
+    )
+
+
 def observed_contact_sides_v1(snapshot):
     entity = next((e for e in snapshot.visual_scene.entities if e.track_id == snapshot.skill.subject_ref), None)
     if entity is None or entity.visibility is not Visibility.CLEAR:
@@ -184,6 +238,19 @@ def _convex_closest_points(vertices, patch):
             return None
         simplex.append(next_pair)
     return None
+
+
+def tool_subject_convex_gap_v1(tool, footprint, centroid, extent):
+    """标定工具与当前观测竖直轮廓棱柱的距离；重叠仍只表示接触候选。"""
+    subject_vertices = np.asarray([(x, y, z) for x, y in footprint
+        for z in (centroid[2] - extent[2] / 2, centroid[2] + extent[2] / 2)])
+    distances = []
+    for part in tool.parts:
+        result = _convex_closest_points(np.asarray(part.vertices_robot_base_m), subject_vertices)
+        if result is None:
+            return None  # 数值求解未确定时不能用其余部件证明整个工具净空。
+        distances.append(result[0])
+    return min(distances)
 
 
 def contact_geometry_v1(snapshot, side, delta=(0.0, 0.0, 0.0)):
